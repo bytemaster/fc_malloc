@@ -1,4 +1,3 @@
-#include <jemalloc/jemalloc.h>
 #include <atomic>
 #include <stdint.h>
 #include <memory.h>
@@ -62,44 +61,47 @@ inline int64_t fast_rand()
 }
 
 
-template<uint32_t Size>
+template<uint32_t Size, uint32_t NumSlots>
 struct page
 {
   public:
     struct slot 
     { 
-        int32_t page_id; 
-        int16_t page_size; 
-        int16_t page_slot;
-        char _data[Size];
+        int32_t page_id;     // used by free to find the page in the pool
+        int16_t pool_id;     // used by free to find the pool
+        uint8_t page_slot;   // the slot in the page in the pool
+        uint8_t alignment;   // 8 if reserved, 0 if free... byte _data[alignment-1] = alignment.
+        char    _data[Size]; // alignment helps us find the page_id/pool_id when allocated aligned objects.
     };
-    page(int16_t page_id)
+
+    page(int16_t page_id, int16_t pool_id)
     {
-       _free_count  = 256;
+       _free_count  = NumSlots;
        _alloc_count = 0;
-       for( int i = 0; i < 256; ++i )
+       for( int i = 0; i < NumSlots; ++i )
        {
           slot& s = _slot[i];
-          s.page_id   = page_id;
-          s.page_size = Size;
+          s.page_id = page_id;
+          s.pool_id = pool_id;
           s.page_slot = i;
        }
     }
-  
-    // last scan pos
-    uint8_t _last_pos = 0;
 
     char*  alloc( uint64_t pos )
     {
        int used = 0;
-       while( _reserved[++_last_pos] && used < 256 )
+       // TODO: compare 8 bytes at a time, increment pointers
+       // instead of 'indexes' will make this faster.
+       // TODO: ++_last_pos only works if _last_pos is uint8 and size is 256... 
+       //       must be fixed!!!!
+       while( _reserved[++_last_pos] && used < NumSlots )
        {
          ++used;
        }
-       if( used >= 255 )
+       if( used >= NumSlots )
        {
-          _free_count = 256;
-          _alloc_count = 256;
+          _free_count = NumSlots;
+          _alloc_count = NumSlots;
           return nullptr;
        }
        ++_alloc_count;
@@ -107,57 +109,183 @@ struct page
        return _slot[_last_pos]._data;
     }
 
-    void   free( char* s )
-    {
-    }
-
     int32_t free_estimate() { return _free_count - _alloc_count; }
 
     /** updates the estimate */
     int32_t calc_free()     
     {
-       auto end = _reserved+256;
+       auto end = _reserved+NumSlots;
        int32_t count = 0;
        for( auto i = _reserved; i < end; ++i )
           count += 1 == *i;
 
        _alloc_count = count;
-       _free_count = 256;
+       _free_count = NumSlots;
        return count;
     }
 
     uint32_t _free_count;
     uint32_t _alloc_count;
-    uint8_t  _reserved[256];
-    slot     _slot[256];
+    uint8_t  _reserved[NumSlots];
+    // last scan pos
+    uint8_t  _last_pos = 0;
+    slot     _slot[NumSlots];
 };
 
-template<uint32_t Size>
+
+/**
+ *   Manages a mini sorted array of size 256 of
+ *   available slots.  
+ *   that can serve sizes between Size and Size/MaxSlots.
+ *
+ *   The heap sorts all slots by size (smallest first),
+ *   the max size slot is tracked as well as the
+ *   max free slot.
+ *
+ *   When a slot is released, its size is compared
+ *   against the current largest free block and then
+ *   swapped. This can be done with a CAS. The
+ *   total 'free' bytes is also tracked.
+ *
+ *   When a thread needs to allocate a new chunk that
+ *   is too big for the current page (due to fragmentation),
+ *   it will scan the list of dynamic_pages for the
+ *   the block with the 'most total free' and has
+ *   a fragment of acceptable size.  It will then
+ *   take over this 'heap', clean it up and return
+ *   the allocated buffer.
+ */
+template<uint32_t Size, uint32_t MaxSlots=256> 
+struct dynamic_page
+{
+   // TODO: assert MaxSlots is power of 2
+    struct slot // sizeof(slot) == 16... keep things aligned.
+    {
+       int32_t  page_id;    // identifies page in the dynamic_pool
+       uint16_t pool_id;    // the dynamic pool this slot is from
+       uint8_t  merged;     // has this slot been merged 
+       uint8_t  reserved;   // 8 for reserved, 0 for free, aka alignment,
+                            // if the slot has alignment 
+    };
+
+    struct slot_index
+    {
+       uint32_t size;     // bytes allocated for this chunk.
+       slot_ptr 
+    };
+    typedef slot* slot_ptr;
+
+    char      _buffer[Size];
+
+    // array of slot pointers sorted by slot size.
+    slot_ptr  _slist[MaxSlots];   // array of allocated blocks..
+    size_t    _slist_size;        // valid slots in _slist
+    size_t    _max_free_slot;     // updated by free() never read by allocator, written to by allocator 
+                                  // when ever it divides the largest block.. which shouldn't happen
+                                  // often because it chooses best fit first.
+    size_t    _total_free;        // total free bytes... estimate of free bytes.
+    size_t    _total_free_slots;  // estimate of free slots  _total_free / _total_free_slots 
+                                  // gives an estimate of fragmentation.
+
+    dynamic_page( uint16_t page_id )
+    {
+      memset( _slist,0,sizeof(slist) );
+      memset( _buffer,0,sizeof(buffer) );
+      _slist->page_id  = page_id;
+      _slist->size     = Size - sizeof(slot);
+      _slist->reserved = 0;
+
+      _slist[0] = (slot*)_reserved_slots;
+      _slist_size = 1;
+    }
+
+    char*     alloc( uint32_t size )
+    {
+       slot_ptr canidate = nullptr;
+       for( size_t s = 0; s < _slist_size; ++s )
+       {
+          slot_ptr cur = _slist[s];
+          if( cur->reserved || cur->merged ) continue;
+          if( cur->size > size )
+          {
+            canidate = cur;
+            continue;
+          }
+          slot_ptr next = cur + 1 + cur->size / sizeof(slot);
+          if( !next->reserved )
+          {
+              assert( !next->merged );
+              // merge next into current block
+              cur->size    += next->size + sizeof(slot);
+              // mark 'next' for removal from the slist heap.
+              next->merged = true;
+          }
+
+          // if we have enough to create a new 64 byte block...
+          // split the block
+          if( canidate && (canidate->size-64) > size && _slist_size < MaxSlots )
+          {
+             _slist[_slist_size]
+          }
+          break;
+       }
+       return (char*)(canidate+1);
+    }
+    void    free( slot_ptr s )
+    {
+        assert( s->reserved == 1 );
+        s->reserved = 0;
+        total_free += s->size + sizeof(slot);
+        if( s->size > _max_free_slot )
+        {
+           // note... max free size is just an estimate because
+           // we could do a CAS here... which would make sure
+           // allocation remains effecient... CAS would only
+           // be required when _max_free_slot was growing...
+           // which would grealty reduce the contention.
+           _max_free_slot = s->size;
+        }
+    }
+};
+
+
+
+
+
+
+
+
+
+
+template<uint16_t PoolId,uint32_t Size,uint32_t SlotsPerPage,uint32_t MaxPages=1024*32>
 struct pool
 {
    typedef page<Size>*            page_ptr;
-   static page_ptr                pages[1024*32];
-   static uint8_t                 reserved_pages[1024*32];
+   static page_ptr                pages[MaxPages]
+   static uint8_t                 reserved_pages[MaxPages]
 
    static __thread int32_t        _current;
    static std::atomic<int32_t>    _last_page;
 
+   /**
+    * Estimates the total number of slots that have not 
+    * been freed.
+    */
    static int64_t used_estimate()
    {
       int64_t total = 0;
       auto l = _last_page.load();
       for( int i = 0; i < l; ++i )
       {
-          total += 256 - pages[i]->calc_free();
+          total += SlotsPerPage - pages[i]->calc_free();
       }
-      return 256*l - total;
+      return SlotsPerPage*l - total;
    }
    
    static page<Size>& get_current()
    {
       uint32_t c = _current;
       if( c == -1 ) {
-          std::cerr<<"alloc... \n";
          _current = 0;
          return *alloc_page();
       }
@@ -177,6 +305,10 @@ struct pool
         // not atomic, but then again only one thread should
         // ever be freeing this memory at a time and it cannot
         // be allocated again until it is read as 0...
+        // 
+        // The value 'should be 1', if it is already 0 then we have
+        // 'double free' error.
+        //assert( p->_reserved[sl->page_slot] == 1 );
         p->_reserved[sl->page_slot] = 0;
    }
 
@@ -187,16 +319,19 @@ struct pool
    static page_ptr alloc_page()
    {
       int claim = _last_page.fetch_add(1);
+
+      // TODO: this should allocate via mmap() instead of malloc because
+      // our goal is to replace malloc.
       page<Size>* p = (page<Size>*)malloc( sizeof(page<Size>) );
-      new (p) page<Size>(claim); // in place construct
+      new (p) page<Size>(claim, PoolId); // in place construct
 
       // TODO: convert to CAS loop... this is broken
       pages[claim] = p; // scanners attempting to reclaim pages check for 'null' anyway.. no need
                         // to CAS this.  It is good enough that we reserved the spot atomicaly
-                        //
-      reserved_pages[_current] = 0; // unreserve the page
+                        
+   //   reserved_pages[_current] = 0; // unreserve the page
       _current = claim;
-      reserved_pages[_current] = 1; // unreserve the page
+      reserved_pages[claim] = 1; // unreserve the page
       return p;
    }
 
@@ -209,6 +344,9 @@ struct pool
     */
    static page_ptr claim_page(uint64_t pos)
    {
+      assert( _current >= 0 );
+      _reserved[_current] = 0;
+
       auto last_p = _last_page.load( std::memory_order_relaxed );
       for( int i = 0; i < last_p; ++i )
       {
@@ -216,9 +354,10 @@ struct pool
         {
            if( 0 == ((std::atomic<uint8_t>*)&reserved_pages[i])->fetch_add(1) )
            {
-              reserved_pages[_current] = 0; // unreserve the current page
+         //     reserved_pages[_current] = 0; // unreserve the current page
               _current = i;
-              reserved_pages[_current] = 1; // reserve the new page
+         //   unnecessary we already clamed it.
+         //     reserved_pages[_current] = 1; // reserve the new page
               return pages[i];
            }
         }
@@ -226,11 +365,14 @@ struct pool
       return alloc_page();
    }
 
+   /**
+    *   Attempts to allocate in the current page, else
+    *   finds a free page and attempts to allocate there.
+    */
    static char*  alloc()
    {
       char* c = get_current().alloc(0);
-      if( c ) 
-         return c;
+      if( c ) return c;
       auto p = claim_page(0);
       return p->alloc(0);
    }
