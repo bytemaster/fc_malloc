@@ -47,7 +47,22 @@ random sizes as well.
 |----------------------------|-------------|-------------|-------------|
 | Random Single Threaded     | 5.8s        |  4.5s       |  2.6s       |
 | Random Multi Threaded (10) | 18.2s       |  13.6s      |  6.8s       |
-|----------------------------|-------------|-------------|-------------|
+
+Threads|fcalloc (s)|jemalloc(s)|fcram(MB)|jeram(mb)
+---|---|---|---|---
+1|4.8|9.7|97|84.3
+2|5.9|14.8|120|104
+3|6.5|16.8|145|123
+4|7|18|167|142
+5|8|18.9|185.5|160
+6|8.7|20.3|214.3|189
+7|9.9|22.9|238|212
+8|11.4|25.2|257|224
+9|12.5|26.1|278|244
+10|12.9|27.9|308|270
+
+
+
 
 As you can see from the results fc_malloc is over 2x faster than the
 stock malloc even for single threaded cases.  For multi-threaded cases

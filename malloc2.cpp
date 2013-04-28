@@ -18,7 +18,7 @@ using namespace disruptor;
 
 #define PAGE_SIZE (8*1024*1024)
 #define BENCH_SIZE ( (1024*512) )
-#define ROUNDS 30 
+#define ROUNDS 60 
 
 struct block_header
 {
@@ -448,34 +448,89 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
 }
 
 
-void pc_bench(char* (*do_alloc)(int s), void (*do_free)(char*)  )
+void pc_bench(int n, char* (*do_alloc)(int s), void (*do_free)(char*)  )
 {
   for( int i = 0; i < 16; ++i )
   {
     buffers[i].resize( BENCH_SIZE );
     memset( buffers[i].data(), 0, 8 * BENCH_SIZE );
   }
-  std::thread a( [=](){ pc_bench_worker( 1, 2, do_alloc, do_free ); } );
-  std::thread b( [=](){ pc_bench_worker( 2, 3, do_alloc, do_free ); } );
-  std::thread c( [=](){ pc_bench_worker( 3, 4, do_alloc, do_free ); } );
-  std::thread d( [=](){ pc_bench_worker( 4, 5, do_alloc, do_free ); } );
-  std::thread e( [=](){ pc_bench_worker( 5, 6, do_alloc, do_free ); } );
-  std::thread f( [=](){ pc_bench_worker( 6, 7, do_alloc, do_free ); } );
-  std::thread g( [=](){ pc_bench_worker( 7, 8, do_alloc, do_free ); } );
-  std::thread h( [=](){ pc_bench_worker( 8, 9, do_alloc, do_free ); } );
-  std::thread i( [=](){ pc_bench_worker( 9, 10, do_alloc, do_free ); } );
-  std::thread j( [=](){ pc_bench_worker( 10, 1, do_alloc, do_free ); } );
 
-  a.join();
-  b.join();
-  c.join();
-  d.join();
-  e.join();
-  f.join();
-  g.join();
-  h.join();
-  i.join();
-  j.join();
+  std::thread* a = nullptr;
+  std::thread* b = nullptr;
+  std::thread* c = nullptr;
+  std::thread* d = nullptr;
+  std::thread* e = nullptr;
+  std::thread* f = nullptr;
+  std::thread* g = nullptr;
+  std::thread* h = nullptr;
+  std::thread* i = nullptr;
+  std::thread* j = nullptr;
+
+
+ int s = 1;
+  switch( n )
+  {
+     case 10:
+     a = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 9:
+      b = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 8:
+      c = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 7:
+      d = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 6:
+     e = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 5:
+     f = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 4:
+      g = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 3:
+      h = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 2:
+      i = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+     n--;
+     s++;
+     case 1:
+      j = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
+  }
+  if(a)
+  a->join();
+  if(b)
+  b->join();
+  if(c)
+  c->join();
+  if(d)
+  d->join();
+  if(e)
+  e->join();
+  if(f)
+  f->join();
+  if(g)
+  g->join();
+  if(h)
+  h->join();
+  if(i)
+  i->join();
+  if(j)
+  j->join();
+
 }
 void pc_bench_st(char* (*do_alloc)(int s), void (*do_free)(char*)  )
 {
@@ -495,15 +550,15 @@ void  do_malloc_free(char* c){ ::free(c); }
 
 int main( int argc, char** argv )
 {
-  if( argc > 1 && argv[1][0] == 'm' )
+  if( argc > 2 && argv[1][0] == 'm' )
   {
     std::cerr<<"malloc multi\n";
-    pc_bench( do_malloc, do_malloc_free );
+    pc_bench( atoi(argv[2]), do_malloc, do_malloc_free );
   }
-  if( argc > 1 && argv[1][0] == 'M' )
+  if( argc > 2 && argv[1][0] == 'M' )
   {
     std::cerr<<"hash malloc multi\n";
-    pc_bench( malloc2, free2 );
+    pc_bench( atoi(argv[2]), malloc2, free2 );
   }
   if( argc > 1 && argv[1][0] == 's' )
   {
