@@ -16,9 +16,9 @@
 
 using namespace disruptor;
 
-#define PAGE_SIZE (8*1024*1024)
-#define BENCH_SIZE ( (1024*512) )
-#define ROUNDS 60 
+#define PAGE_SIZE (4*1024*1024)
+#define BENCH_SIZE ( (2024) )
+#define ROUNDS 20000 
 
 struct block_header
 {
@@ -82,12 +82,12 @@ class thread_allocator
     
     int64_t           _gc_begin;               // how far has gc processed
     int64_t           _pad[7];                 // save the cache lines/prevent false sharing
-    volatile  int64_t _gc_read_end;            // how far can gc read
+    int64_t           _gc_read_end;            // how far can gc read
     int64_t           _pad2[7];                // save the cache lines/prevent false sharing
     int64_t           _gc_read_end_buffer;     // cache writes to gc_read_end to every 10 writes
     int64_t           _gc_read_end_last_write; // cache writes to gc_read_end to every 10 writes
-    int64_t           _cache_pos;
-    int64_t           _cache_end;
+    int64_t           _cache_pos[32];
+    int64_t           _cache_end[32];
 
     char*   get_garbage( int64_t pos ) // grab a pointer previously claimed.
     {
@@ -95,8 +95,8 @@ class thread_allocator
       return _garbage_bin.at(pos);
     }
     block_header*               _next_block;
-    ring_buffer<char*,1024*16>  _garbage_bin;
-    ring_buffer<char*,64>       _cache;
+    ring_buffer<char*,1024*8>   _garbage_bin;
+    ring_buffer<char*,4>        _cache[32];
 };
 
 
@@ -133,20 +133,38 @@ class garbage_collector
     class recycle_bin
     {
        public:
-          recycle_bin()
-          :_next_write(0),_write_pos(0),_read_pos(0)
+          recycle_bin(int num = 0)
+          :_next_write(0),_write_pos(0),_read_pos(0),_bin_num(num)
           {
           }
+          void sync_write_pos()
+          {
+     //       ((std::atomic<int64_t>*)&_write_pos)->load();
+          }
+
           int64_t                       _next_write;
           int64_t                       _pad0[7];
           int64_t                       _write_pos;
           int64_t                       _pad[7];
           std::atomic<int64_t>          _read_pos;
           int64_t                       _pad2[7];
-          ring_buffer<char*,1024*1024>  _free_bin;
+          ring_buffer<char*,1024*256>   _free_bin;
+          int                           _bin_num;
     };
 
-    recycle_bin&  get_bin( size_t s ) { return _bins[0]; }
+    std::atomic<int64_t>  _sync;
+
+    int get_bin_num( size_t s )
+    {
+      #define LOG2(X) ((unsigned) (8*sizeof (unsigned long long) - __builtin_clzll((X)) - 1))
+      return LOG2(s)+1;
+    }
+
+    recycle_bin&  get_bin( size_t bin_num ) 
+    { 
+        assert( bin_num < 32 );
+        return _bins[bin_num];
+    }
 
     void register_allocator( thread_alloc_ptr ta );
     void unregister_allocator( thread_alloc_ptr ta );
@@ -160,11 +178,11 @@ class garbage_collector
     static void  run();
     void  recycle( char* c );
 
-    std::thread            _thread;
-    recycle_bin            _bins[1];
-    std::atomic<uint32_t>  _next_talloc;
-    thread_alloc_ptr       _tallocs[128];
-    static std::atomic<bool>      _done;
+    std::thread                _thread;
+    recycle_bin                _bins[32];
+    std::atomic<uint32_t>      _next_talloc;
+    thread_alloc_ptr           _tallocs[128];
+    static std::atomic<bool>   _done;
 };
 std::atomic<bool> garbage_collector::_done(false);
 
@@ -233,23 +251,23 @@ void  garbage_collector::run()
 void garbage_collector::recycle( char* c )
 {
    block_header* h = ((block_header*)c)-1;
-   //printf( "recycle thread allocator page_pos: %d\n", h->_page_pos );
-   switch( h->_next - h->_page_pos )
+   assert( h->_next - h->_page_pos > 0 );
+   recycle_bin& b = get_bin( get_bin_num(h->_next - h->_page_pos)  );
+   auto p = b._next_write++;
+   while( b._free_bin.at(p) != nullptr )
    {
-      default:
-      {
-        recycle_bin& b = _bins[0];
-        auto p = b._next_write++;
-        b._free_bin.at(p) = c;
-     //   b._write_cur.publish(p);
-        b._write_pos = p;
-      }
+      fprintf( stderr, "opps.. someone left something behind...\n" );
+      p = b._next_write++;
    }
+   b._free_bin.at(p) = c;
+   b._write_pos = p;
+//   if( b._write_pos % 256 == 128 ) 
+ //     b.sync_write_pos();
 }
 
 block_header* allocate_block_page()
 {
-    printf( "allocate block page!\n" );
+    fprintf( stderr, "#" );
     auto limit = mmap_alloc( PAGE_SIZE );
 
     block_header* _next_block = reinterpret_cast<block_header*>(limit);
@@ -268,8 +286,8 @@ thread_allocator::thread_allocator()
   _gc_read_end_buffer = 0;
   _gc_read_end_last_write = 0;
   _next_block = allocate_block_page();
-  _cache_pos = 0;
-  _cache_end = 0;
+  memset( _cache_pos, 0, sizeof(_cache_pos) );
+  memset( _cache_end, 0, sizeof(_cache_end) );
 
   garbage_collector::get().register_allocator(this);
 }
@@ -290,6 +308,7 @@ thread_allocator::~thread_allocator()
 
 char* thread_allocator::alloc( size_t s )
 {
+    assert( s > 0 );
     s = 64*((s + 63)/64); // multiples of 64 bytes
 
     if( s+sizeof(block_header) >= PAGE_SIZE  )
@@ -298,14 +317,25 @@ char* thread_allocator::alloc( size_t s )
        // do direct mmap 
       return nullptr;
     }
-    if( _cache_pos < _cache_end )
+    int bin_num = garbage_collector::get().get_bin_num( s );
+
+
+    if( _cache_pos[bin_num] < _cache_end[bin_num] )
     {
-       char* c = _cache.at(_cache_pos);
-       ++_cache_pos;
+       char* c = _cache[bin_num].at(_cache_pos[bin_num]);
+       ++_cache_pos[bin_num];
        return c;
     }
+    static int64_t hit = 0;
+    static int64_t miss = 0;
+    static int64_t sync_count = 0;
+    ++sync_count;
 
-    garbage_collector::recycle_bin* rb = &garbage_collector::get().get_bin( s );
+    garbage_collector::recycle_bin* rb = &garbage_collector::get().get_bin( bin_num );
+
+ //   if( sync_count % 64  == 63 ) 
+ //       rb->sync_write_pos();
+
     while( rb )
     {
        // TODO: ATOMIC ... switch to non-atomic check
@@ -313,32 +343,42 @@ char* thread_allocator::alloc( size_t s )
       // printf( "recyclebin wirte_pos: %d  read_cur.begin %d\n", write_pos, rb->_read_cur.pos().aquire()  );
 
        auto avail = write_pos - *((int64_t*)&rb->_read_pos);
-       if(  avail > 32 )// /*.load( std::memory_order_relaxed )*/ < write_pos )
+       if(  avail > 16 )// /*.load( std::memory_order_relaxed )*/ < write_pos )
        {
           // ATOMIC CLAIM FROM SHARED POOL... MOST EXPENSIVE OP WE HAVE...
           //auto pos = rb->_read_cur.pos().atomic_increment_and_get(1)-1;
-          auto pos = rb->_read_pos.fetch_add(16,std::memory_order_relaxed);
+          //auto pos = rb->_read_pos.fetch_add(4,std::memory_order_relaxed);
+          auto pos = rb->_read_pos.fetch_add(16);//,std::memory_order_acquire);
           auto e = pos + 16;
           while( pos < e )
           {
              char* b = rb->_free_bin.at(pos);
              if( b )
              {
-                _cache.at(_cache_end++) = b;
+                _cache[bin_num].at(_cache_end[bin_num]++) = b;
                 rb->_free_bin.at(pos) = nullptr;
+             } 
+             else
+             {
+               fprintf( stderr, "read too much..\n" );
              }
              ++pos;
           }
 
-          if( _cache_pos < _cache_end )
+          if( _cache_pos[bin_num] < _cache_end[bin_num] )
           {
-             char* c = _cache.at(_cache_pos);
-             ++_cache_pos;
+             char* c = _cache[bin_num].at(_cache_pos[bin_num]);
+             ++_cache_pos[bin_num];
+             ++hit;
              return c;
           }
        } // else there are no blocks our size... go up a size or two?..
        break;
     }
+    ++miss;
+    if( miss % 10000 == 0 )
+    fprintf( stderr, "\nHit: %lld    Miss: %lld          \r", hit, miss );
+
     // we already checked the 'best fit' bin and failed to find 
     // anything that size ready, so we can allocate it from our 
     // thread local block
@@ -346,14 +386,18 @@ char* thread_allocator::alloc( size_t s )
  //   printf( "allocating new chunk from thread local page\n" );
 
     // make sure the thread local block has enough space...
-    if( _next_block->_page_pos + s + sizeof(block_header) > PAGE_SIZE )
+    if( _next_block->_page_pos + s + sizeof(block_header) >= PAGE_SIZE )
     {
         // not enough space left in current block.. free it... if it has any space at all.
         if( _next_block->_page_pos != PAGE_SIZE )
+        {
             free( (char*)(_next_block+1) );
+        }
 
         _next_block = allocate_block_page();
+        assert( _next_block != nullptr );
     }
+   // fprintf( stderr, "alloc %d   at block pos %d\n", s+1, _next_block->_page_pos );
 
     block_header* new_b   = _next_block;
     _next_block = new_b + 1 + s/sizeof(block_header);
@@ -422,9 +466,9 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
          uint32_t p = fast_rand() % buffers[pro].size();
          if( !buffers[pro][p] )
          {
-           auto si = 60; //fast_rand() % (1<<15);
+           uint64_t si = 32 + fast_rand()%(8096*16); //4000;//32 + fast_rand() % (1<<16);
            auto r = do_alloc( si );
-         //  assert( r != nullptr );
+           assert( r != nullptr );
          //  assert( r[0] != 99 ); 
          //  r[0] = 99; 
            buffers[pro][p] = r;
