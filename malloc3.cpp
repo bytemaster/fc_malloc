@@ -11,47 +11,58 @@
 #include <vector>
 #include <unordered_set>
 
-//#include "mmap_alloc.hpp"
+#include "mmap_alloc.hpp"
 #include "disruptor.hpp"
 #include <thread>
-#include "fast_rand.cpp"
+#include <stdint.h>
+#include <memory.h>
+#include <stdlib.h>
+#include <iostream>
+#include <vector>
+#include <assert.h>
+#include <unistd.h>
+//#include "rand.cpp"
 
 
 using namespace disruptor;
 
 #define PAGE_SIZE (4*1024*1024)
-#define BENCH_SIZE ( (2024) )
-#define ROUNDS 200000 
+#define BENCH_SIZE ( (1024) )
+#define ROUNDS 2
 #define LOG2(X) ((unsigned) (8*sizeof (unsigned long long) - __builtin_clzll((X)) - 1))
-#define NUM_BINS 22 // log2(PAGE_SIZE)
+#define NUM_BINS 32 // log2(PAGE_SIZE)
 
 class block_header
 {
    public:
-      block_header* next()const 
+      block_header* next()
       { 
-         if( _size > 0 ) return reinterpret_cast<block_header*>(&_data+_size); 
+         if( _size > 0 ) return reinterpret_cast<block_header*>(data()+_size); 
          else return nullptr;
       }
-      block_header* prev()const 
+      block_header* prev()
       { 
-         if( _prev_size == 0 ) return nullptr;
-         reinterpret_cast<block_header*>(reinterpret_cast<char*>(this) - _prev_size - 8);
+         if( _prev_size <= 0 ) return nullptr;
+         return reinterpret_cast<block_header*>(reinterpret_cast<char*>(this) - _prev_size - 8);
       }
 
-      char*         data()      { return &_data;     }
+      char*         data()      { return ((char*)this)+8; }
       size_t        size()const { return abs(_size); }
 
       /** create a new block at p and return it */
       block_header* split_after( size_t s )
       {
-         if( size()-8-s < 32 ) return nullptr; // no point in splitting to less than 32 bytes
+         
+     //    printf( "split after %d  _size %d   size() - 8 - s: %d\n", (int)s, _size, int(size()-8-s) );
+         if(  (size() - 8 -32) < s ) return nullptr;// no point in splitting to less than 32 bytes
+       //  if( size()-8-s < 32 ) return nullptr; 
 
          block_header* n = reinterpret_cast<block_header*>(data()+s);
          n->_prev_size   = s;
          n->_size        = size() -s -8;
          if( _size < 0 ) n->_size = -n->_size; // we just split the tail
          _size = s; // this node now has size s
+         assert( size() >= s );
          return n;
       }
 
@@ -60,6 +71,7 @@ class block_header
       {
          auto nxt = next();
          if( !nxt ) return this;
+         assert( (char*)nxt - (char*)this == _size + 8 );
          _size += 8 + nxt->size();
          auto nxt_nxt = nxt->next();
          if( nxt_nxt ) 
@@ -78,6 +90,7 @@ class block_header
       {
          auto pre = prev();
          if( !pre ) return this;
+         assert( (char*)this - (char*)pre == _prev_size + 8 );
          auto _s = size() + 8;
          assert( pre->_size > 0 );
          pre->_size += _s;
@@ -92,7 +105,6 @@ class block_header
 //   private:
       int32_t   _prev_size; // size of previous header.
       int32_t   _size; // offset to next, negitive indicates tail
-      char      _data; // start of data... (ASSUME PACKED HEADER)
 };
 
 /** returns a new block page allocated via mmap 
@@ -105,6 +117,21 @@ struct block_list_node
 {
     block_list_node():next(nullptr){};
     block_list_node* next;
+
+    block_header&    header()
+    {
+      return  *reinterpret_cast<block_header*>(reinterpret_cast<char*>(this)-8);
+    }
+
+    block_list_node* find_end() 
+    {
+       block_list_node* n = this;
+       while( n->next )
+       {
+          n = n->next;
+       }
+       return n;
+    }
 };
 
 
@@ -116,6 +143,7 @@ class thread_allocator
     void    free( char* c )
     {
         block_header* b = reinterpret_cast<block_header*>(c) - 1;
+  //      printf( "free bh %p d %p  _size  %d  _prev_size %d\n", b, c, b->_size, b->_prev_size );
 
         if( cache(b) ) return;
 
@@ -137,7 +165,7 @@ class thread_allocator
         static __thread thread_allocator* tld = nullptr;
         if( !tld )  // new is not an option
         { 
-            tld = reinterpret_cast<thread_allocator*>( malloc(sizeof(thread_allocator))/*mmap_alloc( sizeof(thread_allocator)*/ );
+            tld = reinterpret_cast<thread_allocator*>( mmap_alloc( sizeof(thread_allocator) ) );
             tld = new (tld) thread_allocator(); // inplace construction
 
             // TODO: allocate  pthread_threadlocal var, attach a destructor /clean up callback
@@ -154,7 +182,23 @@ class thread_allocator
      *  caching reduces contention on the
      *  atomic add.
      */
-    bool  cache( block_header* h ) { return false; }
+    bool  cache( block_header* h ) 
+    { 
+       auto b = LOG2(h->size()); 
+       if( _bin_cache_size[b] < 4 )
+       {
+           printf( "cache %d in bin %d  size: %d\n", (int)h->size(), (int)b, int(1<<b) );
+           assert( h->size() >= 1<<b );
+           reinterpret_cast<block_list_node*>(h->data())->next = _bin_cache[b].next;
+           _bin_cache[b].next = reinterpret_cast<block_list_node*>(h->data());
+           _bin_cache_size[b]++;
+           return true; 
+       } return false;
+    }
+
+
+
+    block_header* fetch_block_from_bin( int bin );
 
     thread_allocator();
     ~thread_allocator();
@@ -216,19 +260,53 @@ class garbage_collector
     {
        public:
           recycle_bin()
-          :_read_pos(0),_full_count(0),_size_limit(1),write_pos(0)
+          :_read_pos(0),_full_count(0),_full(2),_write_pos(0)
           {
              memset( &_free_queue, 0, sizeof(_free_queue) );
           }
 
           // read the _read_pos without any atomic sync, we only care about an estimate
-          int64_t available()                            { return _write_pos - *((int64_t*)&rb->_read_pos); }
+          int64_t available()                            { return _write_pos - *((int64_t*)&_read_pos); }
           // reserve right to read the next num spots from buffer
           int64_t claim( int64_t num )                   { return _read_pos.fetch_add(num, std::memory_order_relaxed); }
           block_header* get_block( int64_t claim_pos )   { return _free_queue.at(claim_pos); }
           void          clear_block( int64_t claim_pos ) { _free_queue.at(claim_pos) = nullptr; }
 
-
+          // determines how many chunks should be required to consider this bin full.
+          // TODO: this method needs to be tweaked to factor in 'time'... as it stands
+          // now the GC loop will be very agressive at shrinking the queue size
+          int64_t       check_status()
+          {
+              auto av = available();
+              if( av <= 0 )
+              {
+                 // apparently there is high demand, the consumers cleaned us out.
+                 _full *= 2; // exponential growth..
+                 _full = std::min( _full+4, _free_queue.get_buffer_size() -1 );
+              }
+              else if( av == _full )
+              {
+                 // apparently no one wanted any... we should shrink what we consider full
+                 _full -= 4; // fast back off
+                 if( _full < 2 ) _full = 2;
+              }
+              else // av < _full
+              {
+                 // some, but not all have been consumed... 
+                 // if less than half have been consumed... reduce size,
+                 // else keep the size the same.
+                 if( av > _full/2 )
+                 {
+                     _full--; // reduce full size,slow back off
+                     if( _full < 2 ) _full = 2;
+                     return  _full - av; 
+                 }
+                 else // more than half consumed... keep full size the same, refill
+                 {
+                 }
+              }
+              return _full - av; 
+          }
 
 
 
@@ -236,16 +314,21 @@ class garbage_collector
           std::atomic<int64_t>                  _read_pos; //written to by read threads
           int64_t _pad[7];     // below this point is written to by gc thread
           int64_t _full_count; // how many times gc thread checked and found the queue full
-          int64_t _size_limit; // limit the number of blocks kept in queue
+          int64_t _full;       // limit the number of blocks kept in queue
           int64_t _write_pos;  // read by consumers to know the last valid entry.
 
           // used to find blocks available for merging.
           std::unordered_set<block_header*>     _free_set; 
     };
 
+    recycle_bin& find_bin_for( block_header* h ) 
+    { 
+      return get_bin(get_bin_num( h->size() )); 
+    }
+
     int get_bin_num( size_t s )
     {
-      return LOG2(s)+1;
+      return LOG2(s);
     }
 
     recycle_bin&  get_bin( size_t bin_num ) 
@@ -255,7 +338,6 @@ class garbage_collector
     }
 
     void register_allocator( thread_alloc_ptr ta );
-    void unregister_allocator( thread_alloc_ptr ta );
 
     static garbage_collector& get()
     {
@@ -264,31 +346,20 @@ class garbage_collector
     }
   private:
     static void  run();
-    void  recycle( char* c );
+    // threads that we are actively looping on
+    std::atomic<thread_alloc_ptr> _thread_head;
 
     std::thread                _thread; // gc thread.. doing the hard work
     recycle_bin                _bins[NUM_BINS];
-    
-    // used to track thread-local storage
-    std::atomic<uint32_t>      _next_new_talloc;
-    std::atomic<uint32_t>      _next_free_talloc;
 
-    // threads that we are actively looping on
-    size_t                     _tallocs_size;
-    thread_alloc_ptr           _tallocs[MAX_THREADS];
 
-    // threads that are ready for GC...
-    ring_buffer<thread_alloc_ptr,MAX_THREADS> _free_tallocs;
-    // threads ready to start..
-    ring_buffer<thread_alloc_ptr,MAX_THREADS> _new_tallocs;
     static std::atomic<bool>   _done;
 };
 std::atomic<bool> garbage_collector::_done(false);
 
 garbage_collector::garbage_collector()
-:_thread( &garbage_collector::run )
+:_thread_head(nullptr),_thread( &garbage_collector::run )
 {
-  memset( _tallocs, 0, sizeof(_tallocs) );
 }
 garbage_collector::~garbage_collector()
 {
@@ -299,19 +370,10 @@ garbage_collector::~garbage_collector()
 void garbage_collector::register_allocator( thread_alloc_ptr ta )
 {
   printf( "registering thread allocator %p\n", ta );
-  // TODO: just lock here... 
-  auto pos = _next_talloc.fetch_add(1);
-  _tallocs[pos] = ta;
-}
-void garbage_collector::unregister_allocator( thread_alloc_ptr ta )
-{
-  for( int i = 0; i < 128; ++i )
-  {
-    if( _tallocs[i] == ta ) 
-    {
-      _tallocs[i] = nullptr;
-    }
-  }
+
+  auto* stale_head = _thread_head.load(std::memory_order_relaxed);
+  do { ta->_next = stale_head;
+  }while( !_thread_head.compare_exchange_weak( stale_head, ta, std::memory_order_release ) );
 }
 
 void  garbage_collector::run()
@@ -319,71 +381,144 @@ void  garbage_collector::run()
     garbage_collector& self = garbage_collector::get();
     while( true )
     {
+        thread_alloc_ptr cur_al = *((thread_alloc_ptr*)&self._thread_head);
         bool found_work = false;
-        for( int i = 0; i < 128; i++ )
+
+        // for each thread, grab all of the free chunks and move them into
+        // the proper free set bin, but save the list for a follow-up merge
+        // that takes into consideration all free chunks.
+        while( cur_al )
         {
-             // TODO: not safe assumption, threads can come/go at will
-             // leaving holes... thread cleanup code needs locks around it
-             // to prevent holes..
-            if( self._tallocs[i] != nullptr ) 
-            {
-                auto b = self._tallocs[i]->_gc_begin;
-                auto e = self._tallocs[i]->_gc_read_end;
+          auto cur = cur_al->get_garbage();
 
-                if( b != e ) found_work = true;
-                for( auto p = b; p < e; ++p )
+          if( cur ) found_work = true; 
+
+          while( cur )
+          {
+              block_header* c = &cur->header();
+              block_header* n = c->next();
+              block_header* p = c->prev();
+
+           //   printf( "freeing block with size: %d  %d   prev_size: %d\n", (int)c->size(), c->_size, c->_prev_size );
+              
+              // check to see if the next block is free
+            #if 1
+              if( n )
+              {
+                recycle_bin& n_bin = self.find_bin_for(n);
+                auto itr = n_bin._free_set.find(n);
+                if( itr != n_bin._free_set.end() )
                 {
-                    char* c = self._tallocs[i]->get_garbage(p);
-
-
-                    self.recycle( c);
+               //     printf( "merging block with next._prev_size = %d  next._size = %d   _size = %d\n", 
+                //                n->_prev_size, n->_size, c->_size );
+                    n_bin._free_set.erase(itr);
+                
+                    // it is free, merge it with c
+                    c = c->merge_next();
                 }
-                self._tallocs[i]->_gc_begin = e; 
+              }
+              
+              if( p ) 
+              {
+                  // check to see if the next block is free
+                  recycle_bin& p_bin = self.find_bin_for(p);
+                  auto pitr = p_bin._free_set.find(p);
+                  if( pitr != p_bin._free_set.end() )
+                  {
+              //        printf( "merging block with prev._prev_size = %d  prev._size = %d   _prev_size = %d  delta ptr %d %p %p\n", 
+               //                 p->_prev_size, p->_size, c->_prev_size,  int((char*)c - (char*)p), c, p);
+                      p_bin._free_set.erase(pitr);
+                      // it is free, merge it with c
+                      c = c->merge_prev();
+                  }
+              }
+            #endif
+
+              // store the potentially combined block 
+              // in the proper bin.
+              recycle_bin& c_bin = self.find_bin_for(c);
+              c_bin._free_set.insert(c);
+
+              // get the next free chunk
+              assert( cur != cur->next );
+              cur = cur->next;
+          }
+          // get the next thread.
+          assert( cur_al != cur_al->_next );
+          cur_al = cur_al->_next;
+        }
+
+        // for each recycle bin, check the queue to see if it
+        // is getting low and if so, put some chunks in play
+        for( int i = 0; i < NUM_BINS; ++i )
+        {
+            garbage_collector::recycle_bin& bin = self._bins[i];
+            auto needed = bin.check_status(); // returns the number of chunks need
+            if( needed > 0 )
+            {
+              found_work = true;
+              int64_t next_write_pos = bin._write_pos;
+              for( auto bitr = bin._free_set.begin(); 
+                        needed && bitr != bin._free_set.end();
+                         )
+              {
+                 ++next_write_pos;
+                 if( nullptr != bin._free_queue.at(next_write_pos) )
+                 {
+                    // apparently a reader skipped one due to contention, it
+                    // can be reclaimed now..
+                 }
+                 else 
+                 {
+                     bin._free_queue.at(next_write_pos) = *bitr;
+                     bitr =  bin._free_set.erase(bitr);
+                 }
+                 --needed;
+              }
+              bin._write_pos = next_write_pos;
+            }
+            else if( needed < 0 )
+            {
+              // apparently no one is checking this size class anymore, we can reclaim some nodes.
+              // TODO:  perhaps we only do this if there is no other work found as work implies
+              // that the user is still allocating / freeing objects and thus we don't want to
+              // compete to start freeing cache yet... 
             }
         }
+
+        if( _done.load( std::memory_order_acquire ) ) return;
         if( !found_work ) 
         {
-        //  usleep(0);
-            if( _done.load( std::memory_order_acquire ) ) return;
+            // reclaim cache
+            // sort... 
+
+
+            usleep( 1000 );
         }
     }
 }
 
-void garbage_collector::recycle( char* c )
-{
-   block_header* h = ((block_header*)c)-1;
-   assert( h->_next - h->_page_pos > 0 );
-   recycle_bin& b = get_bin( get_bin_num(h->_next - h->_page_pos)  );
-   auto p = b._next_write++;
-   while( b._free_bin.at(p) != nullptr )
-   {
-//      fprintf( stderr, "opps.. someone left something behind...\n" );
-      p = b._next_write++;
-   }
-   b._free_bin.at(p) = c;
-   b._write_pos = p;
-//   if( b._write_pos % 256 == 128 ) 
- //     b.sync_write_pos();
-}
 
 block_header* allocate_block_page()
 {
-    fprintf( stderr, "#" );
-    auto limit = malloc(PAGE_SIZE);//mmap_alloc( PAGE_SIZE );
+    fprintf( stderr, "\n\n                                                                               ALLOCATING NEW PAGE\n\n" );
+    auto limit = mmap_alloc( PAGE_SIZE );
 
     block_header* bl = reinterpret_cast<block_header*>(limit);
     bl->_prev_size = 0;
     bl->_size = - (PAGE_SIZE-8);
-    return _bl;
+    return bl;
 }
 
 thread_allocator::thread_allocator()
 {
+  _done            = false;
   _next            = nullptr;
-  _alloc_block     = nullptr;
   _gc_at_bat.next  = nullptr;
   _gc_on_deck.next = nullptr;
   garbage_collector::get().register_allocator(this);
+  memset( _bin_cache, 0, sizeof(_bin_cache) );
+  memset( _bin_cache_size, 0, sizeof(_bin_cache_size) );
 }
 
 thread_allocator::~thread_allocator()
@@ -391,40 +526,63 @@ thread_allocator::~thread_allocator()
   // give the rest of our allocated chunks to the gc thread
   // free all cache, free _alloc_block
   _done = true;
-  garbage_collector::get().unregister_allocator(this);
+}
+
+int get_min_bin( size_t s )
+{
+  return LOG2(s)+1;
 }
 
 char* thread_allocator::alloc( size_t s )
 {
+//    printf( "alloc %d\n", (int)s );
     if( s == 0 ) return nullptr;
     // calculate min block size
-    s = 32*((s + 31)/32); // multiples of 64 bytes
+    s = 32*((s + 31)/32); // multiples of 32 bytes
 
     // if greater than PAGE_SIZE mmap_alloc
     if( s > (PAGE_SIZE-8) )
     {
-       auto limit = malloc(PAGE_SIZE);//mmap_alloc( PAGE_SIZE );
+       auto limit = mmap_alloc( PAGE_SIZE );
        block_header* bl = reinterpret_cast<block_header*>(limit);
        bl->_prev_size = -s; // PAGE ALLOCATED blocks have a negitive prev.
        bl->_size = 0; // no forward size... 'this is the end' if this block
                       // somehow gets mixed in with others.
+       assert( bl->size() >= s );
        return bl->data();
     }
-
-    for( int bin = get_min_bin(s); bin < max_bin; ++bin )
+    
+    for( int bin = get_min_bin(s); bin < NUM_BINS; ++bin )
     {
         block_header* b = fetch_block_from_bin(bin);
         if( b )
         {
+        printf( "    USING BIN bin: %d (%d) for chunk size %d\n", bin, int(1<<bin), (int)s );
+          // printf( "1) b->size: %d  s: %d\n", (int)b->size(), (int)s );
            block_header* tail = b->split_after( s );
-           if( tail ) free( tail->data() );
+         //  printf( "2) b->size: %d  s: %d\n", (int)b->size(), (int)s );
+           assert( b->size() >= s );
+           if( tail ) 
+              this->free( tail->data() );
+        //   printf( "3) b->size: %d  s: %d   delta: %d\n", (int)b->size(), (int)s, int(b->size() - s) );
+           assert( b->size() >= s );
            return b->data();
         }
     }
 
     block_header* new_page = allocate_block_page();
+    //printf( "      alloc new block page   %p  _size  %d _prev_size %d  next %p  prev %p\n",
+      //    new_page, new_page->_size, new_page->_prev_size, new_page->next(), new_page->prev() );
     block_header* tail = new_page->split_after(s);
-    if( tail ) free( tail->data() );
+//    printf( "      alloc free tail  %p  _size  %d _prev_size %d  next %p  prev %p  tail %p\n",
+ //         tail, tail->_size, tail->_prev_size, tail->next(), tail->prev(), tail );
+    
+    if( tail )
+    {
+  //    printf( "        FREE TAIL SIZE: %d   %p  %p\n", (int)tail->size(), tail, tail->data() );
+      this->free( tail->data() );
+    }
+    assert( new_page->size() >= s );
     return new_page->data();
 }
 
@@ -438,8 +596,8 @@ block_header* thread_allocator::fetch_block_from_bin( int bin )
     if( _bin_cache[bin].next ) 
     {
         _bin_cache_size[bin]--;
-        block_header* bh = _bin_cache[bin].next;
-        _bin_cache[bin].next = reinterpret_cast<block_list_node*>(bh->data)->next;
+        block_header* bh = &_bin_cache[bin].next->header();
+        _bin_cache[bin].next = reinterpret_cast<block_list_node*>(bh->data())->next;
         return bh;
     }
     else
@@ -452,7 +610,7 @@ block_header* thread_allocator::fetch_block_from_bin( int bin )
             // claim up to half of the available, just incase 2
             // threads try to claim at once, they both can, but
             // don't hold a cache of more than 4 items
-            auto claim_num = std::min( avail/2, 3 ); 
+            auto claim_num = std::min<int64_t>( avail/2, 3 ); 
             // claim_num could now be 0 to 3
             claim_num++; // claim at least 1 and at most 4
 
@@ -467,9 +625,9 @@ block_header* thread_allocator::fetch_block_from_bin( int bin )
                {
                   found = true;
                   rb.clear_block(claim_pos); // let gc know we took it. 
-                  ln = reinterpret_cast<block_list_node*>(h->data());
-                  ln->next = _bin_cache[bin]->next;
-                  _bin_cache[bin]->next = ln;
+                  auto ln = reinterpret_cast<block_list_node*>(h->data());
+                  ln->next = _bin_cache[bin].next;
+                  _bin_cache[bin].next = ln;
                }
                else // oops... I guess 3 tried to claim at once...
                {
@@ -534,12 +692,12 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
 {
   for( int r = 0; r < ROUNDS; ++r )
   {
-      for( int x = 0; x < buffers[pro].size()/2 ; ++x )
+      for( size_t x = 0; x < buffers[pro].size()/2 ; ++x )
       {
-         uint32_t p = fast_rand() % buffers[pro].size();
+         uint32_t p = rand() % buffers[pro].size();
          if( !buffers[pro][p] )
          {
-           uint64_t si = 32 + fast_rand()%(8096*16); //4000;//32 + fast_rand() % (1<<16);
+           uint64_t si = 32 + rand()%(8096*16); //4000;//32 + rand() % (1<<16);
            auto r = do_alloc( si );
            assert( r != nullptr );
          //  assert( r[0] != 99 ); 
@@ -547,9 +705,9 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
            buffers[pro][p] = r;
          }
       }
-      for( int x = 0; x < buffers[con].size()/2 ; ++x )
+      for( size_t x = 0; x < buffers[con].size()/2 ; ++x )
       {
-         uint32_t p = fast_rand() % buffers[con].size();
+         uint32_t p = rand() % buffers[con].size();
          assert( p < buffers[con].size() );
          assert( con < 16 );
          assert( con >= 0 );
@@ -656,21 +814,21 @@ void pc_bench_st(char* (*do_alloc)(int s), void (*do_free)(char*)  )
     buffers[i].resize( BENCH_SIZE );
     memset( buffers[i].data(), 0, 8 * BENCH_SIZE );
   }
-  int i = 0;
+  //int i = 0;
   std::thread a( [=](){ pc_bench_worker( 1, 1, do_alloc, do_free ); } );
   a.join();
 }
-#include <tbb/scalable_allocator.h>
+//#include <tbb/scalable_allocator.h>
 
 char* do_malloc(int s)
 { 
-//    return (char*)::malloc(s); 
-   return (char*)scalable_malloc(s);
+    return (char*)::malloc(s); 
+//   return (char*)scalable_malloc(s);
 }
 void  do_malloc_free(char* c)
 { 
-    scalable_free(c);
-  // ::free(c); 
+//    scalable_free(c);
+   ::free(c); 
 }
 
 int main( int argc, char** argv )
@@ -679,22 +837,59 @@ int main( int argc, char** argv )
   {
     std::cerr<<"malloc multi\n";
     pc_bench( atoi(argv[2]), do_malloc, do_malloc_free );
+    return 0;
   }
   if( argc > 2 && argv[1][0] == 'M' )
   {
     std::cerr<<"hash malloc multi\n";
     pc_bench( atoi(argv[2]), malloc2, free2 );
+    return 0;
   }
   if( argc > 1 && argv[1][0] == 's' )
   {
     std::cerr<<"malloc single\n";
     pc_bench_st( do_malloc, do_malloc_free );
+    return 0;
   }
   if( argc > 1 && argv[1][0] == 'S' )
   {
     std::cerr<<"hash malloc single\n";
     pc_bench_st( malloc2, free2 );
+    return 0;
   }
+
+  printf( "alloc\n" );
+  char* tmp = malloc2( 61 );
+  usleep( 1000 );
+  char* tmp2 = malloc2( 134 );
+  usleep( 1000 );
+  char* tmp4 = malloc2( 899 );
+  printf( "a %p  b %p   c %p\n", tmp, tmp2, tmp4 );
+
+  usleep( 1000 );
+
+  printf( "free\n" );
+  free2( tmp );
+  usleep( 1000 );
+  free2( tmp2 );
+  usleep( 1000 );
+  free2( tmp4 );
+
+  usleep( 1000*1000 );
+
+  printf( "alloc again\n" );
+  char* tmp1 = malloc2( 61 );
+  usleep( 1000 );
+  char* tmp3 = malloc2( 134 );
+  usleep( 1000 );
+  char* tmp5 = malloc2( 899 );
+  printf( "a %p  b %p   c %p\n", tmp1, tmp3, tmp5 );
+  free2( tmp1 );
+  free2( tmp3 );
+  free2( tmp4 );
+
+  usleep( 1000*1000 );
+
   return 0;
 }
 
