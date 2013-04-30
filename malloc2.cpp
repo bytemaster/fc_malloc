@@ -9,7 +9,7 @@
  */
 
 #include <vector>
-#include "mmap_alloc.hpp"
+//#include "mmap_alloc.hpp"
 #include "disruptor.hpp"
 #include <thread>
 #include "fast_rand.cpp"
@@ -18,7 +18,8 @@ using namespace disruptor;
 
 #define PAGE_SIZE (4*1024*1024)
 #define BENCH_SIZE ( (2024) )
-#define ROUNDS 20000 
+#define ROUNDS 200000 
+#define LOG2(X) ((unsigned) (8*sizeof (unsigned long long) - __builtin_clzll((X)) - 1))
 
 struct block_header
 {
@@ -27,6 +28,8 @@ struct block_header
    uint32_t   _next;
    uint32_t   _timestamp;// creation time... we want to use 'old blocks' first
                          // because they are most likley to contain long-lived objects
+   size_t calc_size(){ return _next - _page_pos;   }
+   int calc_bin_num(){ return LOG2(calc_size())+1; }
 };
 block_header* allocate_block_page();
 
@@ -46,6 +49,14 @@ class thread_allocator
   public:
     void    free( char* c )
     {
+      block_header* b = reinterpret_cast<block_header*>(c) - 1;
+      int bin = b->calc_bin_num();
+      if( _cache_pos[bin] > _cache_end[bin] - 32 )
+      {
+         _cache[bin].at(_cache_end[bin]++) = c;
+         return;
+      }
+      
       auto pos = _gc_read_end_buffer;
       _garbage_bin.at(pos) = c;
       _gc_read_end_buffer = pos + 1;
@@ -65,7 +76,7 @@ class thread_allocator
         static __thread thread_allocator* tld = nullptr;
         if( !tld )  // new is not an option
         { 
-            tld = reinterpret_cast<thread_allocator*>( mmap_alloc( sizeof(thread_allocator) ) );
+            tld = reinterpret_cast<thread_allocator*>( malloc(sizeof(thread_allocator))/*mmap_alloc( sizeof(thread_allocator)*/ );
             tld = new (tld) thread_allocator(); // inplace construction
 
             // TODO: allocate  pthread_threadlocal var, attach a destructor /clean up callback
@@ -75,6 +86,8 @@ class thread_allocator
     }
 
   protected:
+    char*  split_chunk( char* c, size_t l );
+
     thread_allocator();
     ~thread_allocator();
 
@@ -156,7 +169,6 @@ class garbage_collector
 
     int get_bin_num( size_t s )
     {
-      #define LOG2(X) ((unsigned) (8*sizeof (unsigned long long) - __builtin_clzll((X)) - 1))
       return LOG2(s)+1;
     }
 
@@ -235,6 +247,8 @@ void  garbage_collector::run()
                 for( auto p = b; p < e; ++p )
                 {
                     char* c = self._tallocs[i]->get_garbage(p);
+
+
                     self.recycle( c);
                 }
                 self._tallocs[i]->_gc_begin = e; 
@@ -256,7 +270,7 @@ void garbage_collector::recycle( char* c )
    auto p = b._next_write++;
    while( b._free_bin.at(p) != nullptr )
    {
-      fprintf( stderr, "opps.. someone left something behind...\n" );
+//      fprintf( stderr, "opps.. someone left something behind...\n" );
       p = b._next_write++;
    }
    b._free_bin.at(p) = c;
@@ -268,7 +282,7 @@ void garbage_collector::recycle( char* c )
 block_header* allocate_block_page()
 {
     fprintf( stderr, "#" );
-    auto limit = mmap_alloc( PAGE_SIZE );
+    auto limit = malloc(PAGE_SIZE);//mmap_alloc( PAGE_SIZE );
 
     block_header* _next_block = reinterpret_cast<block_header*>(limit);
     _next_block->_page_pos = 0;
@@ -305,6 +319,14 @@ thread_allocator::~thread_allocator()
   // mmap_free( this, sizeof(*this) );
 }
 
+/**
+ *  returns len bytes starting at s, potentially freeing 
+ *  anything after s+len.
+ */
+char* thread_allocator::split_chunk( char* s, size_t len )
+{
+  return s; 
+}
 
 char* thread_allocator::alloc( size_t s )
 {
@@ -319,66 +341,71 @@ char* thread_allocator::alloc( size_t s )
     }
     int bin_num = garbage_collector::get().get_bin_num( s );
 
-
-    if( _cache_pos[bin_num] < _cache_end[bin_num] )
+    int limit = std::min<int>(bin_num + 4,32);
+    for( int i = bin_num; i < limit; ++i )
     {
-       char* c = _cache[bin_num].at(_cache_pos[bin_num]);
-       ++_cache_pos[bin_num];
-       return c;
+      if( _cache_pos[i] < _cache_end[i] )
+      {
+         char* c = _cache[i].at(_cache_pos[i]);
+         ++_cache_pos[i];
+
+         return split_chunk( c, s );
+      }
     }
     static int64_t hit = 0;
     static int64_t miss = 0;
     static int64_t sync_count = 0;
     ++sync_count;
-
-    garbage_collector::recycle_bin* rb = &garbage_collector::get().get_bin( bin_num );
-
  //   if( sync_count % 64  == 63 ) 
  //       rb->sync_write_pos();
 
-    while( rb )
+
+    int end_bin = bin_num+1;// + 4;
+    for( ; bin_num < end_bin; ++ bin_num )
     {
-       // TODO: ATOMIC ... switch to non-atomic check
-       auto write_pos = rb->_write_pos;
-      // printf( "recyclebin wirte_pos: %d  read_cur.begin %d\n", write_pos, rb->_read_cur.pos().aquire()  );
-
-       auto avail = write_pos - *((int64_t*)&rb->_read_pos);
-       if(  avail > 16 )// /*.load( std::memory_order_relaxed )*/ < write_pos )
+       garbage_collector::recycle_bin* rb = &garbage_collector::get().get_bin( bin_num );
+       while( rb )
        {
-          // ATOMIC CLAIM FROM SHARED POOL... MOST EXPENSIVE OP WE HAVE...
-          //auto pos = rb->_read_cur.pos().atomic_increment_and_get(1)-1;
-          //auto pos = rb->_read_pos.fetch_add(4,std::memory_order_relaxed);
-          auto pos = rb->_read_pos.fetch_add(16);//,std::memory_order_acquire);
-          auto e = pos + 16;
-          while( pos < e )
+          // TODO: ATOMIC ... switch to non-atomic check
+          auto write_pos = rb->_write_pos;
+         // printf( "recyclebin wirte_pos: %d  read_cur.begin %d\n", write_pos, rb->_read_cur.pos().aquire()  );
+       
+          auto avail = write_pos - *((int64_t*)&rb->_read_pos);
+          if(  avail > 16 )// /*.load( std::memory_order_relaxed )*/ < write_pos )
           {
-             char* b = rb->_free_bin.at(pos);
-             if( b )
+             // ATOMIC CLAIM FROM SHARED POOL... MOST EXPENSIVE OP WE HAVE...
+             //auto pos = rb->_read_cur.pos().atomic_increment_and_get(1)-1;
+             //auto pos = rb->_read_pos.fetch_add(4,std::memory_order_relaxed);
+             auto pos = rb->_read_pos.fetch_add(8);//,std::memory_order_acquire);
+             auto e = pos + 8;
+             while( pos < e )
              {
-                _cache[bin_num].at(_cache_end[bin_num]++) = b;
-                rb->_free_bin.at(pos) = nullptr;
-             } 
-             else
-             {
-               fprintf( stderr, "read too much..\n" );
+                char* b = rb->_free_bin.at(pos);
+                if( b )
+                {
+                   _cache[bin_num].at(_cache_end[bin_num]++) = b;
+                   rb->_free_bin.at(pos) = nullptr;
+                } 
+                else
+                {
+         //         fprintf( stderr, "read too much..\n" );
+                }
+                ++pos;
              }
-             ++pos;
-          }
-
-          if( _cache_pos[bin_num] < _cache_end[bin_num] )
-          {
-             char* c = _cache[bin_num].at(_cache_pos[bin_num]);
-             ++_cache_pos[bin_num];
-             ++hit;
-             return c;
-          }
-       } // else there are no blocks our size... go up a size or two?..
-       break;
+       
+             if( _cache_pos[bin_num] < _cache_end[bin_num] )
+             {
+                char* c = _cache[bin_num].at(_cache_pos[bin_num]);
+                ++_cache_pos[bin_num];
+                ++hit;
+                return c;
+             }
+          } // else there are no blocks our size... go up a size or two?..
+          break;
+       }
+       ++miss;
+   //    if( miss % 10000 == 0 ) fprintf( stderr, "\nHit: %lld    Miss: %lld          \r", hit, miss );
     }
-    ++miss;
-    if( miss % 10000 == 0 )
-    fprintf( stderr, "\nHit: %lld    Miss: %lld          \r", hit, miss );
-
     // we already checked the 'best fit' bin and failed to find 
     // anything that size ready, so we can allocate it from our 
     // thread local block
@@ -587,10 +614,18 @@ void pc_bench_st(char* (*do_alloc)(int s), void (*do_free)(char*)  )
   std::thread a( [=](){ pc_bench_worker( 1, 1, do_alloc, do_free ); } );
   a.join();
 }
+#include <tbb/scalable_allocator.h>
 
-
-char* do_malloc(int s){ return (char*)::malloc(s); }
-void  do_malloc_free(char* c){ ::free(c); }
+char* do_malloc(int s)
+{ 
+//    return (char*)::malloc(s); 
+   return (char*)scalable_malloc(s);
+}
+void  do_malloc_free(char* c)
+{ 
+    scalable_free(c);
+  // ::free(c); 
+}
 
 int main( int argc, char** argv )
 {

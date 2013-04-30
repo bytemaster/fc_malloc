@@ -21,6 +21,8 @@
 #include <vector>
 #include <assert.h>
 #include <unistd.h>
+#include <iostream>
+#include <sstream>
 //#include "rand.cpp"
 
 
@@ -28,7 +30,7 @@ using namespace disruptor;
 
 #define PAGE_SIZE (4*1024*1024)
 #define BENCH_SIZE ( (1024) )
-#define ROUNDS 2
+#define ROUNDS 1000
 #define LOG2(X) ((unsigned) (8*sizeof (unsigned long long) - __builtin_clzll((X)) - 1))
 #define NUM_BINS 32 // log2(PAGE_SIZE)
 
@@ -143,9 +145,10 @@ class thread_allocator
     void    free( char* c )
     {
         block_header* b = reinterpret_cast<block_header*>(c) - 1;
-  //      printf( "free bh %p d %p  _size  %d  _prev_size %d\n", b, c, b->_size, b->_prev_size );
+        printf( "FREE  %p d %p  _size  %d  _prev_size %d\n", b, c, b->_size, b->_prev_size );
 
-        if( cache(b) ) return;
+  //      never try to cache here..??
+  //      if( cache(b) ) return;
 
         auto node = reinterpret_cast<block_list_node*>(c); // store a point
         node->next = _gc_on_deck.next;
@@ -187,7 +190,7 @@ class thread_allocator
        auto b = LOG2(h->size()); 
        if( _bin_cache_size[b] < 4 )
        {
-           printf( "cache %d in bin %d  size: %d\n", (int)h->size(), (int)b, int(1<<b) );
+           printf( "       saving block size %d in bin %d  size: %d -> %d\n", (int)h->size(), (int)b, int(1<<b), int(1<<(b+1)) );
            assert( h->size() >= 1<<b );
            reinterpret_cast<block_list_node*>(h->data())->next = _bin_cache[b].next;
            _bin_cache[b].next = reinterpret_cast<block_list_node*>(h->data());
@@ -283,6 +286,7 @@ class garbage_collector
                  // apparently there is high demand, the consumers cleaned us out.
                  _full *= 2; // exponential growth..
                  _full = std::min( _full+4, _free_queue.get_buffer_size() -1 );
+                 fprintf( stderr, "%d  blocks available,   _full %d\n", int(av), int(_full) );
               }
               else if( av == _full )
               {
@@ -305,6 +309,7 @@ class garbage_collector
                  {
                  }
               }
+               fprintf( stderr, "%d  blocks available,   _full %d  post %d\n", int(av), int(_full), int(_full-av) );
               return _full - av; 
           }
 
@@ -321,8 +326,10 @@ class garbage_collector
           std::unordered_set<block_header*>     _free_set; 
     };
 
-    recycle_bin& find_bin_for( block_header* h ) 
+    recycle_bin& find_cache_bin_for( block_header* h ) 
     { 
+      int bn = get_bin_num(h->size());
+      fprintf( stderr,  "block header size %d  is cached in bin %d holding sizes %d\n", (int)h->size(), bn, (1<<(bn)) );
       return get_bin(get_bin_num( h->size() )); 
     }
 
@@ -360,6 +367,7 @@ std::atomic<bool> garbage_collector::_done(false);
 garbage_collector::garbage_collector()
 :_thread_head(nullptr),_thread( &garbage_collector::run )
 {
+   fprintf( stderr, "allocating garbage collector\n" );
 }
 garbage_collector::~garbage_collector()
 {
@@ -378,6 +386,9 @@ void garbage_collector::register_allocator( thread_alloc_ptr ta )
 
 void  garbage_collector::run()
 {
+    fprintf( stderr, "Starting GC loop\n");
+    try
+    {
     garbage_collector& self = garbage_collector::get();
     while( true )
     {
@@ -399,45 +410,55 @@ void  garbage_collector::run()
               block_header* n = c->next();
               block_header* p = c->prev();
 
-           //   printf( "freeing block with size: %d  %d   prev_size: %d\n", (int)c->size(), c->_size, c->_prev_size );
+              printf( "freeing block with size: %d  %d   prev_size: %d\n", (int)c->size(), c->_size, c->_prev_size );
+              printf( "    cur: %p   prev: %p   next: %p\n", c, p, n );
               
               // check to see if the next block is free
             #if 1
               if( n )
               {
-                recycle_bin& n_bin = self.find_bin_for(n);
+                recycle_bin& n_bin = self.find_cache_bin_for(n);
                 auto itr = n_bin._free_set.find(n);
                 if( itr != n_bin._free_set.end() )
                 {
-               //     printf( "merging block with next._prev_size = %d  next._size = %d   _size = %d\n", 
-                //                n->_prev_size, n->_size, c->_size );
+                    fprintf( stderr, "merging block with next._prev_size = %d  next._size = %d   _size = %d\n", 
+                                n->_prev_size, n->_size, c->_size );
                     n_bin._free_set.erase(itr);
                 
                     // it is free, merge it with c
                     c = c->merge_next();
+                }
+                else
+                {
+                    fprintf( stderr, "       next block not found\n" );
                 }
               }
               
               if( p ) 
               {
                   // check to see if the next block is free
-                  recycle_bin& p_bin = self.find_bin_for(p);
+                  recycle_bin& p_bin = self.find_cache_bin_for(p);
                   auto pitr = p_bin._free_set.find(p);
                   if( pitr != p_bin._free_set.end() )
                   {
-              //        printf( "merging block with prev._prev_size = %d  prev._size = %d   _prev_size = %d  delta ptr %d %p %p\n", 
-               //                 p->_prev_size, p->_size, c->_prev_size,  int((char*)c - (char*)p), c, p);
+                      printf( "merging block with prev._prev_size = %d  prev._size = %d   _prev_size = %d  delta ptr %d %p %p\n", 
+                                p->_prev_size, p->_size, c->_prev_size,  int((char*)c - (char*)p), c, p);
                       p_bin._free_set.erase(pitr);
                       // it is free, merge it with c
                       c = c->merge_prev();
+                  }
+                  else
+                  {
+                    fprintf( stderr, "       prev block not found\n" );
                   }
               }
             #endif
 
               // store the potentially combined block 
               // in the proper bin.
-              recycle_bin& c_bin = self.find_bin_for(c);
-              c_bin._free_set.insert(c);
+              recycle_bin& c_bin = self.find_cache_bin_for(c);
+              auto r = c_bin._free_set.insert(c);
+              assert( r.second );
 
               // get the next free chunk
               assert( cur != cur->next );
@@ -450,16 +471,17 @@ void  garbage_collector::run()
 
         // for each recycle bin, check the queue to see if it
         // is getting low and if so, put some chunks in play
-        for( int i = 0; i < NUM_BINS; ++i )
+        for( int i = 0; found_work && i < NUM_BINS; ++i )
         {
             garbage_collector::recycle_bin& bin = self._bins[i];
             auto needed = bin.check_status(); // returns the number of chunks need
+            fprintf( stderr, "queue  %d  needs %d", i, int(needed) );
             if( needed > 0 )
             {
               found_work = true;
               int64_t next_write_pos = bin._write_pos;
               for( auto bitr = bin._free_set.begin(); 
-                        needed && bitr != bin._free_set.end();
+                        needed > 0 && bitr != bin._free_set.end();
                          )
               {
                  ++next_write_pos;
@@ -470,6 +492,7 @@ void  garbage_collector::run()
                  }
                  else 
                  {
+                     fprintf( stderr, "      moving block %p to free queue %d at pos %lld\n", *bitr, i, next_write_pos );
                      bin._free_queue.at(next_write_pos) = *bitr;
                      bitr =  bin._free_set.erase(bitr);
                  }
@@ -485,6 +508,7 @@ void  garbage_collector::run()
               // compete to start freeing cache yet... 
             }
         }
+        usleep( 1000 );
 
         if( _done.load( std::memory_order_acquire ) ) return;
         if( !found_work ) 
@@ -493,9 +517,14 @@ void  garbage_collector::run()
             // sort... 
 
 
-            usleep( 1000 );
         }
     }
+    }
+    catch ( ... )
+    {
+        fprintf( stderr, "gc caught exception\n" );
+    }
+    fprintf( stderr, "exiting gc loop\n" );
 }
 
 
@@ -535,10 +564,16 @@ int get_min_bin( size_t s )
 
 char* thread_allocator::alloc( size_t s )
 {
-//    printf( "alloc %d\n", (int)s );
+    fprintf( stderr, "    alloc %d\n", (int)s );
     if( s == 0 ) return nullptr;
     // calculate min block size
-    s = 32*((s + 31)/32); // multiples of 32 bytes
+    //s = 8*((s + 7)/8); // multiples of 8 bytes
+    
+    // round to nearest power of 2
+    int min_bin = LOG2(s-1)+1;
+    s = (1<<min_bin);
+
+    fprintf( stderr, "        rounding up to %d\n", (int)s );
 
     // if greater than PAGE_SIZE mmap_alloc
     if( s > (PAGE_SIZE-8) )
@@ -552,17 +587,18 @@ char* thread_allocator::alloc( size_t s )
        return bl->data();
     }
     
-    for( int bin = get_min_bin(s); bin < NUM_BINS; ++bin )
+    fprintf( stderr, "        looking to bin %d  holding blocks of size: %d\n", get_min_bin(s), int(1<<min_bin) );
+    for( int bin = min_bin; bin < NUM_BINS; ++bin )
     {
         block_header* b = fetch_block_from_bin(bin);
         if( b )
         {
-        printf( "    USING BIN bin: %d (%d) for chunk size %d\n", bin, int(1<<bin), (int)s );
+   //     printf( "    USING BIN bin: %d (%d) for chunk size %d\n", bin, int(1<<bin), (int)s );
           // printf( "1) b->size: %d  s: %d\n", (int)b->size(), (int)s );
            block_header* tail = b->split_after( s );
          //  printf( "2) b->size: %d  s: %d\n", (int)b->size(), (int)s );
            assert( b->size() >= s );
-           if( tail ) 
+           if( tail && !cache( tail ) ) 
               this->free( tail->data() );
         //   printf( "3) b->size: %d  s: %d   delta: %d\n", (int)b->size(), (int)s, int(b->size() - s) );
            assert( b->size() >= s );
@@ -577,11 +613,11 @@ char* thread_allocator::alloc( size_t s )
 //    printf( "      alloc free tail  %p  _size  %d _prev_size %d  next %p  prev %p  tail %p\n",
  //         tail, tail->_size, tail->_prev_size, tail->next(), tail->prev(), tail );
     
-    if( tail )
+    if( tail && !cache( tail ) )
     {
-  //    printf( "        FREE TAIL SIZE: %d   %p  %p\n", (int)tail->size(), tail, tail->data() );
-      this->free( tail->data() );
+       this->free( tail->data() );
     }
+
     assert( new_page->size() >= s );
     return new_page->data();
 }
@@ -856,6 +892,45 @@ int main( int argc, char** argv )
     std::cerr<<"hash malloc single\n";
     pc_bench_st( malloc2, free2 );
     return 0;
+  }
+  std::string line;
+  std::getline( std::cin, line );
+    std::vector<char*> data;
+  while( !std::cin.eof() )
+  {
+    std::stringstream ss(line);
+    std::string cmd;
+
+    ss >> cmd;
+    if( cmd == "a" ) // allocate new data
+    {
+      int64_t bytes;
+      ss >> bytes;
+      data.push_back( malloc2( bytes ) );
+    }
+    if( cmd == "f" ) // free data at index
+    {
+      int64_t idx;
+      ss >> idx;
+      free2( data[idx] );
+      data.erase( data.begin() + idx );
+    }
+    if( cmd == "p" ) // print heap
+    {
+
+    }
+    if( cmd == "l" ) // list data
+    {
+       fprintf( stderr, "ID]  ptr  _size   _prev_size\n");
+       fprintf( stderr, "-----------------------------\n");
+       for( size_t i = 0; i < data.size(); ++i )
+       {
+          block_header* bh = reinterpret_cast<block_header*>(data[i]-8);
+          fprintf( stderr, "%d]  %p / %p    %d   %d\n", int(i), data[i], data[i]-8, bh->_size, bh->_prev_size );
+
+       }
+    }
+    std::getline( std::cin, line );
   }
 
   printf( "alloc\n" );
