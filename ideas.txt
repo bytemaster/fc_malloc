@@ -1,0 +1,86 @@
+Global Ready Queue per Size Class of 256 each.... combined with 16 per thread per size assuming 16 threads... class means that
+in the 'idle state' we have
+
+Size allocations are not 'random', but usually fall into predictable patterns.
+The 'ideal' buffer size is one that is never full and never empty... if it ever empties then the next time
+you fill it you should fill it 'fuller' than the last time... and attempt to keep it there.  
+
+If the buffer is 'full' when you check then you can start reclaiming data from that buffer.
+
+
+GC Thread:
+
+For each size class... maintain a hash 'set' of free chunks in that set.
+
+When a new chunk comes in, look for its 'prev' in its hash set, if found remove it, merge the two... then look for the 'next' if found merge the two...
+then store the result back in the new hash table after checking to see if the queue for that size class is waiting for data.
+
+
+GC Thread Loop:
+{
+  foreach thread_garabage_bin
+     pull all chunks, insert them into merge set, then merge them if possible
+
+  foreach size class
+     refill the queue
+        if queue was empty... grow the queue by 4
+        if queue was full... increment full count
+            if full count > N then reclaim 25% and reset full count.
+        pull chunks from proper size heap... 
+          - if not enough are available then divide up chunks from the 
+             next size up.
+        if a chunk reaches the 'page size' and the 'page size' block queue is
+        empty then we can release it back to the OS.
+
+   when there is no merging / reclaiming to do... set a flag and
+   wait on a mutex... next person to call free will wake me up when
+   they see the flag set.
+
+   When choosing empty chunks to place in the queue... pick the chunk from the
+   block with the 'oldest' creation time.  This optimization requires more
+   expensive 'sorting', we can skip this step when ever there is demand for
+   'all chunks' of a particular class size, but when there is only demand for
+   a fraction of the available chunks, then, because we are scanning the
+   hash table linerally... 
+
+   Each node in the hash table points to prev/next pairs... when a hash is
+   'inserted' its memory location is based on its hash value, but its prev/next
+   is based upon order of arival.   Thus you can quickly find a node, then
+   extract like a double-linked-list.  
+}
+
+Merge Cost:
+  2 hash lookups + 1 hash set and perhaps 2 hash clears
+  3 total calls to city hash...
+
+The 'free queue' can be a linked list of the 'freed chunks'.
+  Each thread has its 'ready bin' which it will set 'if null', and
+  its pending bin which it will fill if the ready bin is not null.
+  the memory space in the block is converted into a 'next' pointer.
+  no large per-thread 'free queues'.
+
+  
+
+
+
+
+   queues will adjust in length until they can handle the 'burst' processing rate
+   of the GC thread.
+
+  When the GC thread cannot keep the queues full, then threads fall back on
+  directly allocating their own chunks.
+  
+
+
+Overhead per block.. 8 byte header + 4 byte in free table or 8 byte in queue.
+Queue sizes adjust 
+
+Header:
+prev + next offsets.
+start of mmap chunk sets prev to 0
+end of mmap chunk is a header with next = 0.
+
+
+
+
+
