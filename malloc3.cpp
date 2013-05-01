@@ -30,7 +30,7 @@ using namespace disruptor;
 
 #define PAGE_SIZE (4*1024*1024)
 #define BENCH_SIZE ( (1024) )
-#define ROUNDS 1000
+#define ROUNDS 200000
 #define LOG2(X) ((unsigned) (8*sizeof (unsigned long long) - __builtin_clzll((X)) - 1))
 #define NUM_BINS 32 // log2(PAGE_SIZE)
 
@@ -39,75 +39,170 @@ class block_header
    public:
       block_header* next()
       { 
+         assert(this);
          if( _size > 0 ) return reinterpret_cast<block_header*>(data()+_size); 
          else return nullptr;
       }
       block_header* prev()
       { 
+         assert(this);
          if( _prev_size <= 0 ) return nullptr;
          return reinterpret_cast<block_header*>(reinterpret_cast<char*>(this) - _prev_size - 8);
       }
 
+      enum flags_enum
+      {
+         unknown  = 0,
+         idle     = 1, // in storage, mergable
+         queued   = 2, // in waiting queue...
+         cached   = 4, // cached in thread
+         active   = 8, // in use by app
+         mergable = 16 // track this or will false sharing kill me?
+      };
+
+      struct queue_state // the block is serving as a linked-list node
+      {
+          block_header* next;
+          block_header* prev;
+      };
+
+      void set_state( flags_enum e )
+      {
+         _flags = e;
+      }
+      flags_enum get_state() { return (flags_enum)_flags; }
+
+      queue_state& as_queue_node()
+      {
+         return *reinterpret_cast<queue_state*>(data());
+      }
+
+      queue_state& init_as_queue_node()
+      {
+         // _flags |= queued;
+         queue_state& s = as_queue_node();
+         s.next = nullptr;
+         s.prev = nullptr;
+         return s;
+      }
+
+
+      void init( int s )
+      {
+         _prev_size = 0;
+         _size = - (s-8);
+      }
+
       char*         data()      { return ((char*)this)+8; }
-      size_t        size()const { return abs(_size); }
+      int           size()const { return abs(_size); }
+
+      int raw_size()const { return _size; }
+      int raw_prev_size()const { return _prev_size; }
+
+
+      int        calc_forward_extent()
+      {
+         // fprintf( stderr, "pos %p + %d  -> ", this, _size );
+          int s = size() + 8;
+          auto n = next();
+          if( n ) s += n->calc_forward_extent();
+          return s;
+      }
+
+      int       page_size()
+      {
+          auto h = head();
+          assert(h);
+          return head()->calc_forward_extent(); 
+      }
+      block_header*       head()
+      {
+          auto p = prev();
+          if( p ) return p->head();
+          return this;
+      }
 
       /** create a new block at p and return it */
-      block_header* split_after( size_t s )
+      block_header* split_after( int s )
       {
+         assert( s >= 32 );
+//         fprintf( stderr, "prev_size %d  _size %d  Initial Error: %d\n", _prev_size, _size, int(PAGE_SIZE - this->page_size()) );
+         assert( PAGE_SIZE == page_size() );
          
-     //    printf( "split after %d  _size %d   size() - 8 - s: %d\n", (int)s, _size, int(size()-8-s) );
          if(  (size() - 8 -32) < s ) return nullptr;// no point in splitting to less than 32 bytes
-       //  if( size()-8-s < 32 ) return nullptr; 
 
          block_header* n = reinterpret_cast<block_header*>(data()+s);
          n->_prev_size   = s;
          n->_size        = size() -s -8;
-         if( _size < 0 ) n->_size = -n->_size; // we just split the tail
+         
+         if( _size < 0 ) 
+            n->_size = -n->_size; // we just split the tail
+
          _size = s; // this node now has size s
          assert( size() >= s );
+         assert( PAGE_SIZE == n->page_size() );
+         assert( PAGE_SIZE == page_size() );
          return n;
       }
 
       // merge this block with next, return head of new block.
       block_header* merge_next()
       {
+         assert( PAGE_SIZE == page_size() );
+         assert( _flags == block_header::idle );
          auto nxt = next();
          if( !nxt ) return this;
-         assert( (char*)nxt - (char*)this == _size + 8 );
-         _size += 8 + nxt->size();
-         auto nxt_nxt = nxt->next();
-         if( nxt_nxt ) 
+         assert( nxt->page_size() == PAGE_SIZE );
+
+         // next must be in the idle state
+         if( nxt->_flags != idle ) return this;
+
+         // extract node from the double link list it is in.
+         queue_state& qs = nxt->as_queue_node();
+         if( qs.next )
          {
-             nxt_nxt->_prev_size += 8 + nxt->size();
+      //      assert( qs.next->as_queue_node().prev == nxt );
+            qs.next->as_queue_node().prev = qs.prev;
          }
-         else
+
+         if( qs.prev )
          {
-            _size = -_size; // we are now the end.
+       //     assert( qs.prev->as_queue_node().next == nxt );
+            qs.prev->as_queue_node().next = qs.next;
          }
+
+         // now we are free to merge the memory
+         _size += nxt->size() + 8;
+         fprintf( stderr, "merged to size %d\n", _size );
+         if( nxt->_size < 0 ) _size = -_size;
+
+         nxt = next(); // find the new next.
+         if( nxt )
+         {
+           nxt->_prev_size = size();
+         }
+         assert( PAGE_SIZE == page_size() );
+         if( next() ) assert( PAGE_SIZE == next()->page_size() );
+         if( prev() ) assert( PAGE_SIZE == prev()->page_size() );
          return this;
       }
 
       // merge this block with the prev, return the head of new block
       block_header* merge_prev() 
       {
-         auto pre = prev();
-         if( !pre ) return this;
-         assert( (char*)this - (char*)pre == _prev_size + 8 );
-         auto _s = size() + 8;
-         assert( pre->_size > 0 );
-         pre->_size += _s;
-
-         auto nxt = next();
-         if( nxt ) nxt->_prev_size += _s;
-         else pre->_size = -pre->_size; // 
-
-         return pre;
+         _flags = idle; // mark myself as idle/mergable
+         auto p = prev();
+         if( !p ) return this;
+         if( p->_flags != idle ) return this;
+         return p->merge_next();
       }
 
-//   private:
+   private:
       int32_t   _prev_size; // size of previous header.
-      int32_t   _size; // offset to next, negitive indicates tail
+      int32_t   _size:24; // offset to next, negitive indicates tail, 8 MB max, it could be neg
+      int32_t   _flags:8; // offset to next, negitive indicates tail
 };
+static_assert( sizeof(block_header) == 8, "Compiler is not packing data" );
 
 /** returns a new block page allocated via mmap 
  *  The page has 2 block headers (head+tail) defined
@@ -120,9 +215,17 @@ struct block_list_node
     block_list_node():next(nullptr){};
     block_list_node* next;
 
-    block_header&    header()
+    block_header*    header()
     {
-      return  *reinterpret_cast<block_header*>(reinterpret_cast<char*>(this)-8);
+      return  reinterpret_cast<block_header*>(reinterpret_cast<char*>(this)-8);
+    }
+
+    int count(int prev = 0)
+    {
+      assert( prev < 10 );
+      if( next ) 
+        return next->count(prev +1);
+      return prev+1;
     }
 
     block_list_node* find_end() 
@@ -144,22 +247,22 @@ class thread_allocator
 
     void    free( char* c )
     {
-        block_header* b = reinterpret_cast<block_header*>(c) - 1;
-        printf( "FREE  %p d %p  _size  %d  _prev_size %d\n", b, c, b->_size, b->_prev_size );
+//        block_header* b = reinterpret_cast<block_header*>(c) - 1;
+//        printf( "FREE  %p d %p  _size  %d  _prev_size %d\n", b, c, b->_size, b->_prev_size );
 
   //      never try to cache here..??
   //      if( cache(b) ) return;
 
-        auto node = reinterpret_cast<block_list_node*>(c); // store a point
-        node->next = _gc_on_deck.next;
-        if( !_gc_at_bat.next )
+        auto node = reinterpret_cast<block_header*>(c-8); // store a point
+        node->init_as_queue_node().next = _gc_on_deck;
+        if( !_gc_at_bat )
         {
-           _gc_at_bat.next = node;
-           _gc_on_deck.next = nullptr;
+           _gc_at_bat = node;
+           _gc_on_deck = nullptr;
         }
         else
         {
-           _gc_on_deck.next = node;
+           _gc_on_deck = node;
         }
     }
 
@@ -177,26 +280,55 @@ class thread_allocator
         return *tld;
     }
 
-  protected:
-    /**
-     *  dynamic cache size based on usage makes
-     *  this a 'tricky' method.  Attempt to cache
-     *  'h' and return true if successful.  Successful
-     *  caching reduces contention on the
-     *  atomic add.
-     */
-    bool  cache( block_header* h ) 
-    { 
-       auto b = LOG2(h->size()); 
-       if( _bin_cache_size[b] < 4 )
+    void print_cache()
+    {
+       for( int i = 0; i < NUM_BINS; ++i )
        {
-           printf( "       saving block size %d in bin %d  size: %d -> %d\n", (int)h->size(), (int)b, int(1<<b), int(1<<(b+1)) );
-           assert( h->size() >= 1<<b );
-           reinterpret_cast<block_list_node*>(h->data())->next = _bin_cache[b].next;
-           _bin_cache[b].next = reinterpret_cast<block_list_node*>(h->data());
-           _bin_cache_size[b]++;
-           return true; 
-       } return false;
+          fprintf( stderr, "%d]  size %d   \n", i, _bin_cache_size[i] );
+       }
+    }
+
+  protected:
+
+    bool          store_cache( block_header* h )
+    {
+       assert( h != nullptr );
+       assert( h->page_size() == PAGE_SIZE );
+
+       auto bin = LOG2( h->size() );
+       if( _bin_cache_size[bin] < 4 )
+       {
+          if( _bin_cache_size[bin] == 0 ) assert( nullptr == _bin_cache[bin] );
+
+          block_list_node* bln = reinterpret_cast<block_list_node*>(h->data() );
+          bln->next = _bin_cache[bin];
+          _bin_cache[bin] = bln;
+          _bin_cache_size[bin]++;
+          assert( _bin_cache_size[bin] == _bin_cache[bin]->count() );
+          return true;
+       }
+       fprintf( stderr, "cache full bin %d size %d", bin, _bin_cache_size[bin] );
+       assert( _bin_cache[bin] != nullptr );
+       return false;
+    }
+
+    block_header* fetch_cache( int bin )
+    {
+       if( _bin_cache_size[bin] > 0 )
+       {
+          assert( _bin_cache_size[bin] == _bin_cache[bin]->count() );
+          assert( _bin_cache[bin] );
+          auto h = _bin_cache[bin];
+          _bin_cache[bin] = h->next;
+          _bin_cache_size[bin]--;
+          auto head = h->header();
+          assert( head->page_size() == PAGE_SIZE );
+          assert( LOG2(head->size()) >= bin );
+          assert( LOG2(head->size()) == bin );
+          return head;
+       }
+       assert( !_bin_cache[bin] );
+       return nullptr;
     }
 
 
@@ -208,24 +340,24 @@ class thread_allocator
 
     friend class garbage_collector;
     bool            _done;       // cleanup and remove from list.
-    block_list_node _gc_at_bat;  // where the gc pulls from.
+    block_header*   _gc_at_bat;  // where the gc pulls from.
     uint64_t        _gc_pad[7];  // gc thread and this thread should not false-share these values
-    block_list_node _gc_on_deck; // where we save frees while waiting on gc to bat.
+    block_header*   _gc_on_deck; // where we save frees while waiting on gc to bat.
 
     /** 
      * called by gc thread and pops the at-bat free list
      */
-    block_list_node*  get_garbage() // grab a pointer previously claimed.
+    block_header*  get_garbage() // grab a pointer previously claimed.
     {
-      if( block_list_node* gar = _gc_at_bat.next )
+      if( block_header* gar = _gc_at_bat )
       {
-         _gc_at_bat.next = nullptr;
+         _gc_at_bat = nullptr;
          return gar;
       }
       return nullptr;
     }
-    block_list_node             _bin_cache[NUM_BINS];      // head of cache for specific bin
-    uint16_t                    _bin_cache_size[NUM_BINS]; // track num of nodes in cache
+    block_list_node*            _bin_cache[NUM_BINS];      // head of cache for specific bin
+    int16_t                     _bin_cache_size[NUM_BINS]; // track num of nodes in cache
 
     thread_allocator*           _next; // used by gc to link thread_allocs together
 };
@@ -266,12 +398,13 @@ class garbage_collector
           :_read_pos(0),_full_count(0),_full(2),_write_pos(0)
           {
              memset( &_free_queue, 0, sizeof(_free_queue) );
+             _free_list = nullptr;
           }
 
           // read the _read_pos without any atomic sync, we only care about an estimate
           int64_t available()                            { return _write_pos - *((int64_t*)&_read_pos); }
           // reserve right to read the next num spots from buffer
-          int64_t claim( int64_t num )                   { return _read_pos.fetch_add(num, std::memory_order_relaxed); }
+          int64_t claim( int64_t num )                   { return _read_pos.fetch_add(num); }
           block_header* get_block( int64_t claim_pos )   { return _free_queue.at(claim_pos); }
           void          clear_block( int64_t claim_pos ) { _free_queue.at(claim_pos) = nullptr; }
 
@@ -280,7 +413,12 @@ class garbage_collector
           // now the GC loop will be very agressive at shrinking the queue size
           int64_t       check_status()
           {
+              return 8 - available();
+            /*
               auto av = available();
+              int consumed = _last_fill - av;
+              if( consumed > _last_fill/2 ) ++_full;
+
               if( av <= 0 )
               {
                  // apparently there is high demand, the consumers cleaned us out.
@@ -311,25 +449,55 @@ class garbage_collector
               }
                fprintf( stderr, "%d  blocks available,   _full %d  post %d\n", int(av), int(_full), int(_full-av) );
               return _full - av; 
+              */
           }
 
 
 
-          ring_buffer<block_header*,1024*256>   _free_queue; 
+          ring_buffer<block_header*,128>         _free_queue; 
           std::atomic<int64_t>                  _read_pos; //written to by read threads
           int64_t _pad[7];     // below this point is written to by gc thread
           int64_t _full_count; // how many times gc thread checked and found the queue full
           int64_t _full;       // limit the number of blocks kept in queue
           int64_t _write_pos;  // read by consumers to know the last valid entry.
+          int64_t _last_fill;  // status of the buffer at the last check.
 
-          // used to find blocks available for merging.
-          std::unordered_set<block_header*>     _free_set; 
+          void push( block_header* h )
+          {
+             h->set_state( block_header::idle );
+             block_header::queue_state& qs = h->init_as_queue_node(); 
+             qs.next = _free_list;
+             if( _free_list ) 
+             {
+                _free_list->as_queue_node().prev = h;
+             }
+             _free_list = h;
+          }
+
+          block_header* pop()
+          {
+              auto tmp = _free_list;
+              if( _free_list ) 
+              {
+                 auto n = _free_list->as_queue_node().next;
+                 if( n ) 
+                    n->as_queue_node().prev = nullptr;
+                 _free_list = n;
+                 assert( tmp->get_state() == block_header::idle );
+                 tmp->set_state( block_header::unknown ); // TODO: only if DEBUG
+              }
+              return tmp;
+          }
+
+          // blocks are stored as a double-linked list
+          block_header* _free_list;
     };
 
     recycle_bin& find_cache_bin_for( block_header* h ) 
     { 
+      assert(h!=nullptr);
       int bn = get_bin_num(h->size());
-      fprintf( stderr,  "block header size %d  is cached in bin %d holding sizes %d\n", (int)h->size(), bn, (1<<(bn)) );
+  //    fprintf( stderr,  "block header size %d  is cached in bin %d holding sizes %d\n", (int)h->size(), bn, (1<<(bn)) );
       return get_bin(get_bin_num( h->size() )); 
     }
 
@@ -389,136 +557,96 @@ void  garbage_collector::run()
     fprintf( stderr, "Starting GC loop\n");
     try
     {
-    garbage_collector& self = garbage_collector::get();
-    while( true )
-    {
-        thread_alloc_ptr cur_al = *((thread_alloc_ptr*)&self._thread_head);
-        bool found_work = false;
-
-        // for each thread, grab all of the free chunks and move them into
-        // the proper free set bin, but save the list for a follow-up merge
-        // that takes into consideration all free chunks.
-        while( cur_al )
-        {
-          auto cur = cur_al->get_garbage();
-
-          if( cur ) found_work = true; 
-
-          while( cur )
+      garbage_collector& self = garbage_collector::get();
+      while( true )
+      {
+          thread_alloc_ptr cur_al = *((thread_alloc_ptr*)&self._thread_head);
+          bool found_work = false;
+      
+          // for each thread, grab all of the free chunks and move them into
+          // the proper free set bin, but save the list for a follow-up merge
+          // that takes into consideration all free chunks.
+          while( cur_al )
           {
-              block_header* c = &cur->header();
-              block_header* n = c->next();
-              block_header* p = c->prev();
-
-              printf( "freeing block with size: %d  %d   prev_size: %d\n", (int)c->size(), c->_size, c->_prev_size );
-              printf( "    cur: %p   prev: %p   next: %p\n", c, p, n );
+              auto cur = cur_al->get_garbage();
               
-              // check to see if the next block is free
-            #if 1
-              if( n )
-              {
-                recycle_bin& n_bin = self.find_cache_bin_for(n);
-                auto itr = n_bin._free_set.find(n);
-                if( itr != n_bin._free_set.end() )
-                {
-                    fprintf( stderr, "merging block with next._prev_size = %d  next._size = %d   _size = %d\n", 
-                                n->_prev_size, n->_size, c->_size );
-                    n_bin._free_set.erase(itr);
-                
-                    // it is free, merge it with c
-                    c = c->merge_next();
-                }
-                else
-                {
-                    fprintf( stderr, "       next block not found\n" );
-                }
-              }
+              if( cur ) found_work = true; 
               
-              if( p ) 
+              while( cur )
               {
-                  // check to see if the next block is free
-                  recycle_bin& p_bin = self.find_cache_bin_for(p);
-                  auto pitr = p_bin._free_set.find(p);
-                  if( pitr != p_bin._free_set.end() )
-                  {
-                      printf( "merging block with prev._prev_size = %d  prev._size = %d   _prev_size = %d  delta ptr %d %p %p\n", 
-                                p->_prev_size, p->_size, c->_prev_size,  int((char*)c - (char*)p), c, p);
-                      p_bin._free_set.erase(pitr);
-                      // it is free, merge it with c
-                      c = c->merge_prev();
-                  }
-                  else
-                  {
-                    fprintf( stderr, "       prev block not found\n" );
-                  }
+                  block_header* nxt = cur->as_queue_node().next;
+                  assert( nxt != cur );
+                  if( nxt ) assert( nxt->page_size() == PAGE_SIZE );
+
+                  assert( cur->page_size() == PAGE_SIZE );
+                  auto before = cur->size();
+                //  fprintf( stderr, "found free block of size: %d\n", cur->size() );
+                  cur->init_as_queue_node();
+                  cur->set_state( block_header::idle );
+
+               //   cur = cur->merge_next();
+               //   cur = cur->merge_prev();
+                  if( before != cur->size() )
+                  fprintf( stderr, "found free block of after merges..: %d\n", cur->size() );
+              
+                  recycle_bin& c_bin = self.find_cache_bin_for(cur);
+              //    fprintf( stderr, "pushing into bin\n" );
+                  c_bin.push(cur); 
+              
+                  cur = nxt;
               }
-            #endif
 
-              // store the potentially combined block 
-              // in the proper bin.
-              recycle_bin& c_bin = self.find_cache_bin_for(c);
-              auto r = c_bin._free_set.insert(c);
-              assert( r.second );
-
-              // get the next free chunk
-              assert( cur != cur->next );
-              cur = cur->next;
+              assert( cur_al != cur_al->_next );
+              // get the next thread.
+              cur_al = cur_al->_next;
           }
-          // get the next thread.
-          assert( cur_al != cur_al->_next );
-          cur_al = cur_al->_next;
-        }
-
-        // for each recycle bin, check the queue to see if it
-        // is getting low and if so, put some chunks in play
-        for( int i = 0; found_work && i < NUM_BINS; ++i )
-        {
-            garbage_collector::recycle_bin& bin = self._bins[i];
-            auto needed = bin.check_status(); // returns the number of chunks need
-            fprintf( stderr, "queue  %d  needs %d", i, int(needed) );
-            if( needed > 0 )
-            {
-              found_work = true;
-              int64_t next_write_pos = bin._write_pos;
-              for( auto bitr = bin._free_set.begin(); 
-                        needed > 0 && bitr != bin._free_set.end();
-                         )
+      
+          // for each recycle bin, check the queue to see if it
+          // is getting low and if so, put some chunks in play
+          for( int i = 0; i < NUM_BINS; ++i )
+          {
+              garbage_collector::recycle_bin& bin = self._bins[i];
+              auto needed = bin.check_status(); // returns the number of chunks need
+              if( needed > 0 )
               {
-                 ++next_write_pos;
-                 if( nullptr != bin._free_queue.at(next_write_pos) )
-                 {
-                    // apparently a reader skipped one due to contention, it
-                    // can be reclaimed now..
-                 }
-                 else 
-                 {
-                     fprintf( stderr, "      moving block %p to free queue %d at pos %lld\n", *bitr, i, next_write_pos );
-                     bin._free_queue.at(next_write_pos) = *bitr;
-                     bitr =  bin._free_set.erase(bitr);
-                 }
-                 --needed;
+                  int64_t next_write_pos = bin._write_pos;
+                  block_header* next = bin.pop();
+                  while( next && needed > 0 )
+                  {
+                   //   fprintf( stderr, "poping block from bin %d and pushing into queue\n", i );
+                      found_work = true;
+                      ++next_write_pos;
+                      if( bin._free_queue.at(next_write_pos) )
+                      {
+                          // someone left something behind... 
+                      }
+                      else
+                      {
+                          bin._free_queue.at(next_write_pos) = next;
+                          next = bin.pop();
+                      }
+                      --needed;
+                  }
+                  if( next ) bin.push(next); // leftover... 
+                  bin._write_pos = next_write_pos;
               }
-              bin._write_pos = next_write_pos;
-            }
-            else if( needed < 0 )
-            {
-              // apparently no one is checking this size class anymore, we can reclaim some nodes.
-              // TODO:  perhaps we only do this if there is no other work found as work implies
-              // that the user is still allocating / freeing objects and thus we don't want to
-              // compete to start freeing cache yet... 
-            }
-        }
-        usleep( 1000 );
-
-        if( _done.load( std::memory_order_acquire ) ) return;
-        if( !found_work ) 
-        {
-            // reclaim cache
-            // sort... 
-
-
-        }
-    }
+              else if( needed < 0 )
+              {
+                // apparently no one is checking this size class anymore, we can reclaim some nodes.
+                // TODO:  perhaps we only do this if there is no other work found as work implies
+                // that the user is still allocating / freeing objects and thus we don't want to
+                // compete to start freeing cache yet... 
+              }
+          }
+          if( !found_work ) usleep( 1000 );
+      
+          if( _done.load( std::memory_order_acquire ) ) return;
+          if( !found_work ) 
+          {
+              // reclaim cache
+              // sort... and optimize....
+          }
+      }
     }
     catch ( ... )
     {
@@ -534,8 +662,8 @@ block_header* allocate_block_page()
     auto limit = mmap_alloc( PAGE_SIZE );
 
     block_header* bl = reinterpret_cast<block_header*>(limit);
-    bl->_prev_size = 0;
-    bl->_size = - (PAGE_SIZE-8);
+    bl->init( PAGE_SIZE );
+    
     return bl;
 }
 
@@ -543,11 +671,12 @@ thread_allocator::thread_allocator()
 {
   _done            = false;
   _next            = nullptr;
-  _gc_at_bat.next  = nullptr;
-  _gc_on_deck.next = nullptr;
-  garbage_collector::get().register_allocator(this);
+  _gc_at_bat       = nullptr;
+  _gc_on_deck      = nullptr;
+
   memset( _bin_cache, 0, sizeof(_bin_cache) );
   memset( _bin_cache_size, 0, sizeof(_bin_cache_size) );
+  garbage_collector::get().register_allocator(this);
 }
 
 thread_allocator::~thread_allocator()
@@ -564,43 +693,27 @@ int get_min_bin( size_t s )
 
 char* thread_allocator::alloc( size_t s )
 {
-    fprintf( stderr, "    alloc %d\n", (int)s );
+ //   fprintf( stderr, "    alloc %d\n", (int)s );
     if( s == 0 ) return nullptr;
-    // calculate min block size
-    //s = 8*((s + 7)/8); // multiples of 8 bytes
-    
     // round to nearest power of 2
     int min_bin = LOG2(s-1)+1;
     s = (1<<min_bin);
-
-    fprintf( stderr, "        rounding up to %d\n", (int)s );
-
-    // if greater than PAGE_SIZE mmap_alloc
-    if( s > (PAGE_SIZE-8) )
-    {
-       auto limit = mmap_alloc( PAGE_SIZE );
-       block_header* bl = reinterpret_cast<block_header*>(limit);
-       bl->_prev_size = -s; // PAGE ALLOCATED blocks have a negitive prev.
-       bl->_size = 0; // no forward size... 'this is the end' if this block
-                      // somehow gets mixed in with others.
-       assert( bl->size() >= s );
-       return bl->data();
-    }
     
-    fprintf( stderr, "        looking to bin %d  holding blocks of size: %d\n", get_min_bin(s), int(1<<min_bin) );
+//    fprintf( stderr, "        looking to bin %d  holding blocks of size: %d\n", get_min_bin(s), int(1<<min_bin) );
     for( int bin = min_bin; bin < NUM_BINS; ++bin )
     {
+        fprintf( stderr, "check bin %d\r", bin );
         block_header* b = fetch_block_from_bin(bin);
         if( b )
         {
-   //     printf( "    USING BIN bin: %d (%d) for chunk size %d\n", bin, int(1<<bin), (int)s );
-          // printf( "1) b->size: %d  s: %d\n", (int)b->size(), (int)s );
            block_header* tail = b->split_after( s );
-         //  printf( "2) b->size: %d  s: %d\n", (int)b->size(), (int)s );
+           if( tail ) assert( tail->page_size() == PAGE_SIZE );
            assert( b->size() >= s );
-           if( tail && !cache( tail ) ) 
+           if( tail && !store_cache( tail ) ) 
+           {
+              fprintf( stderr, "unable to cache tail, free it\n" );
               this->free( tail->data() );
-        //   printf( "3) b->size: %d  s: %d   delta: %d\n", (int)b->size(), (int)s, int(b->size() - s) );
+           }
            assert( b->size() >= s );
            return b->data();
         }
@@ -613,12 +726,12 @@ char* thread_allocator::alloc( size_t s )
 //    printf( "      alloc free tail  %p  _size  %d _prev_size %d  next %p  prev %p  tail %p\n",
  //         tail, tail->_size, tail->_prev_size, tail->next(), tail->prev(), tail );
     
-    if( tail && !cache( tail ) )
+    if( tail && !store_cache( tail ) )
     {
        this->free( tail->data() );
     }
 
-    assert( new_page->size() >= s );
+    assert( new_page->size() >= s-8 );
     return new_page->data();
 }
 
@@ -629,52 +742,56 @@ char* thread_allocator::alloc( size_t s )
  */
 block_header* thread_allocator::fetch_block_from_bin( int bin )
 {
-    if( _bin_cache[bin].next ) 
-    {
-        _bin_cache_size[bin]--;
-        block_header* bh = &_bin_cache[bin].next->header();
-        _bin_cache[bin].next = reinterpret_cast<block_list_node*>(bh->data())->next;
-        return bh;
-    }
-    else
-    {
-        garbage_collector& gc              = garbage_collector::get();
-        garbage_collector::recycle_bin& rb = gc.get_bin( bin );
+//    fprintf( stderr, "fetch cache %d  has %d items remaining\n", bin, int(_bin_cache_size[bin]) );    
+    auto lo = fetch_cache(bin);
+    if( lo ) return lo;
+    assert( _bin_cache_size[bin] == 0 );
 
-        if( auto avail = rb.available()  )
+    garbage_collector& gc              = garbage_collector::get();
+    garbage_collector::recycle_bin& rb = gc.get_bin( bin );
+
+    if( auto avail = rb.available()  )
+    {
+        // claim up to half of the available, just incase 2
+        // threads try to claim at once, they both can, but
+        // don't hold a cache of more than 4 items
+        auto claim_num = std::min<int64_t>( avail/2, 3 ); 
+        // claim_num could now be 0 to 3
+        claim_num++; // claim at least 1 and at most 4
+
+        // this is our one and only atomic 'sync' operation... 
+        auto claim_pos = rb.claim( claim_num );
+        auto claim_end = claim_pos + claim_num;
+        bool found = false;
+        while( claim_pos != claim_end )
         {
-            // claim up to half of the available, just incase 2
-            // threads try to claim at once, they both can, but
-            // don't hold a cache of more than 4 items
-            auto claim_num = std::min<int64_t>( avail/2, 3 ); 
-            // claim_num could now be 0 to 3
-            claim_num++; // claim at least 1 and at most 4
-
-            // this is our one and only atomic 'sync' operation... 
-            auto claim_pos = rb.claim( claim_num );
-            auto claim_end = claim_pos + claim_num;
-            bool found = false;
-            while( claim_pos != claim_end )
-            {
-               block_header* h = rb.get_block(claim_pos);
-               if( h )
-               {
-                  found = true;
-                  rb.clear_block(claim_pos); // let gc know we took it. 
-                  auto ln = reinterpret_cast<block_list_node*>(h->data());
-                  ln->next = _bin_cache[bin].next;
-                  _bin_cache[bin].next = ln;
-               }
-               else // oops... I guess 3 tried to claim at once...
-               {
-                  // drop it on the floor and let the
-                  // gc thread pick it up next time through the
-                  // ring buffer.
-               }
-               ++claim_pos;
-            }
-            if( found ) 
-               return fetch_block_from_bin(bin); // grab it from the cache this time.
+           block_header* h = rb.get_block(claim_pos);
+           if( h )
+           {
+              found = true;
+              rb.clear_block(claim_pos); // let gc know we took it. 
+              ++claim_pos;
+              if( claim_pos == claim_end )
+              {
+                  return h;
+              }
+              else if( !store_cache(h ) )
+              {
+                assert( !"unable to cache something we asked for!"  );
+              }
+           }
+           else // oops... I guess 3 tried to claim at once...
+           {
+              ++claim_pos;
+              // drop it on the floor and let the
+              // gc thread pick it up next time through the
+              // ring buffer.
+           }
+        }
+        if( found ) 
+        {
+           fprintf( stderr, "apparently we were over drew the queue...\n" );
+           return fetch_cache(bin); // grab it from the cache this time.
         }
     }
     return nullptr;
@@ -691,286 +808,4 @@ void  free2( char* s )
 }
 
 
-/*  SEQUENTIAL BENCH
-int main( int argc, char** argv )
-{
-  if( argc == 2 && argv[1][0] == 'S' )
-  {
-     printf( "malloc2\n");
-     for( int i = 0; i < 50000000; ++i )
-     {
-        char* test = malloc2( 128 );
-        assert( test != nullptr );
-        test[0] = 1;
-        free2( test );
-     }
-  }
-  if( argc == 2 && argv[1][0] == 's' )
-  {
-     printf( "malloc\n");
-     for( int i = 0; i < 50000000; ++i )
-     {
-        char* test = (char*)malloc( 128 );
-        assert( test != nullptr );
-        test[0] = 1;
-        free( test );
-     }
-  }
-  fprintf( stderr, "done\n");
- // sleep(5);
-  return 0;
-}
-*/
-
-/* RANDOM BENCH */
-std::vector<char*>  buffers[16];
-void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free)(char*)  )
-{
-  for( int r = 0; r < ROUNDS; ++r )
-  {
-      for( size_t x = 0; x < buffers[pro].size()/2 ; ++x )
-      {
-         uint32_t p = rand() % buffers[pro].size();
-         if( !buffers[pro][p] )
-         {
-           uint64_t si = 32 + rand()%(8096*16); //4000;//32 + rand() % (1<<16);
-           auto r = do_alloc( si );
-           assert( r != nullptr );
-         //  assert( r[0] != 99 ); 
-         //  r[0] = 99; 
-           buffers[pro][p] = r;
-         }
-      }
-      for( size_t x = 0; x < buffers[con].size()/2 ; ++x )
-      {
-         uint32_t p = rand() % buffers[con].size();
-         assert( p < buffers[con].size() );
-         assert( con < 16 );
-         assert( con >= 0 );
-         if( buffers[con][p] ) 
-         { 
-           //assert( buffers[con][p][0] == 99 ); 
-          // buffers[con][p][0] = 0; 
-           do_free(buffers[con][p]);
-           buffers[con][p] = 0;
-         }
-      }
-  }
-}
-
-
-void pc_bench(int n, char* (*do_alloc)(int s), void (*do_free)(char*)  )
-{
-  for( int i = 0; i < 16; ++i )
-  {
-    buffers[i].resize( BENCH_SIZE );
-    memset( buffers[i].data(), 0, 8 * BENCH_SIZE );
-  }
-
-  std::thread* a = nullptr;
-  std::thread* b = nullptr;
-  std::thread* c = nullptr;
-  std::thread* d = nullptr;
-  std::thread* e = nullptr;
-  std::thread* f = nullptr;
-  std::thread* g = nullptr;
-  std::thread* h = nullptr;
-  std::thread* i = nullptr;
-  std::thread* j = nullptr;
-
-
- int s = 1;
-  switch( n )
-  {
-     case 10:
-     a = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 9:
-      b = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 8:
-      c = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 7:
-      d = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 6:
-     e = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 5:
-     f = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 4:
-      g = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 3:
-      h = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 2:
-      i = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-     n--;
-     s++;
-     case 1:
-      j = new std::thread( [=](){ pc_bench_worker( n, s, do_alloc, do_free ); } );
-  }
-  if(a)
-  a->join();
-  if(b)
-  b->join();
-  if(c)
-  c->join();
-  if(d)
-  d->join();
-  if(e)
-  e->join();
-  if(f)
-  f->join();
-  if(g)
-  g->join();
-  if(h)
-  h->join();
-  if(i)
-  i->join();
-  if(j)
-  j->join();
-
-}
-void pc_bench_st(char* (*do_alloc)(int s), void (*do_free)(char*)  )
-{
-  for( int i = 0; i < 16; ++i )
-  {
-    buffers[i].resize( BENCH_SIZE );
-    memset( buffers[i].data(), 0, 8 * BENCH_SIZE );
-  }
-  //int i = 0;
-  std::thread a( [=](){ pc_bench_worker( 1, 1, do_alloc, do_free ); } );
-  a.join();
-}
-//#include <tbb/scalable_allocator.h>
-
-char* do_malloc(int s)
-{ 
-    return (char*)::malloc(s); 
-//   return (char*)scalable_malloc(s);
-}
-void  do_malloc_free(char* c)
-{ 
-//    scalable_free(c);
-   ::free(c); 
-}
-
-int main( int argc, char** argv )
-{
-  if( argc > 2 && argv[1][0] == 'm' )
-  {
-    std::cerr<<"malloc multi\n";
-    pc_bench( atoi(argv[2]), do_malloc, do_malloc_free );
-    return 0;
-  }
-  if( argc > 2 && argv[1][0] == 'M' )
-  {
-    std::cerr<<"hash malloc multi\n";
-    pc_bench( atoi(argv[2]), malloc2, free2 );
-    return 0;
-  }
-  if( argc > 1 && argv[1][0] == 's' )
-  {
-    std::cerr<<"malloc single\n";
-    pc_bench_st( do_malloc, do_malloc_free );
-    return 0;
-  }
-  if( argc > 1 && argv[1][0] == 'S' )
-  {
-    std::cerr<<"hash malloc single\n";
-    pc_bench_st( malloc2, free2 );
-    return 0;
-  }
-  std::string line;
-  std::getline( std::cin, line );
-    std::vector<char*> data;
-  while( !std::cin.eof() )
-  {
-    std::stringstream ss(line);
-    std::string cmd;
-
-    ss >> cmd;
-    if( cmd == "a" ) // allocate new data
-    {
-      int64_t bytes;
-      ss >> bytes;
-      data.push_back( malloc2( bytes ) );
-    }
-    if( cmd == "f" ) // free data at index
-    {
-      int64_t idx;
-      ss >> idx;
-      free2( data[idx] );
-      data.erase( data.begin() + idx );
-    }
-    if( cmd == "p" ) // print heap
-    {
-
-    }
-    if( cmd == "l" ) // list data
-    {
-       fprintf( stderr, "ID]  ptr  _size   _prev_size\n");
-       fprintf( stderr, "-----------------------------\n");
-       for( size_t i = 0; i < data.size(); ++i )
-       {
-          block_header* bh = reinterpret_cast<block_header*>(data[i]-8);
-          fprintf( stderr, "%d]  %p / %p    %d   %d\n", int(i), data[i], data[i]-8, bh->_size, bh->_prev_size );
-
-       }
-    }
-    std::getline( std::cin, line );
-  }
-
-  printf( "alloc\n" );
-  char* tmp = malloc2( 61 );
-  usleep( 1000 );
-  char* tmp2 = malloc2( 134 );
-  usleep( 1000 );
-  char* tmp4 = malloc2( 899 );
-  printf( "a %p  b %p   c %p\n", tmp, tmp2, tmp4 );
-
-  usleep( 1000 );
-
-  printf( "free\n" );
-  free2( tmp );
-  usleep( 1000 );
-  free2( tmp2 );
-  usleep( 1000 );
-  free2( tmp4 );
-
-  usleep( 1000*1000 );
-
-  printf( "alloc again\n" );
-  char* tmp1 = malloc2( 61 );
-  usleep( 1000 );
-  char* tmp3 = malloc2( 134 );
-  usleep( 1000 );
-  char* tmp5 = malloc2( 899 );
-  printf( "a %p  b %p   c %p\n", tmp1, tmp3, tmp5 );
-  free2( tmp1 );
-  free2( tmp3 );
-  free2( tmp4 );
-
-  usleep( 1000*1000 );
-
-  return 0;
-}
-
-
-
-
-
-
-
+#include "bench.cpp"
