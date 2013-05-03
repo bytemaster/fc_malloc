@@ -59,30 +59,36 @@ class bit_index<1>
 template<>
 class bit_index<0> : public bit_index<1>{};
 
-/**
- *  Size - number of bits in the index.
- *
- *  Provides O(log64) time search of a bit space for
- *  the first bit with a 1.
- */
 template<>
 class bit_index<64>
 {
     public:
       enum size_enum { index_size = 64 };
-        bit_index():_bits(0){}
+        bit_index(uint64_t s = 0):_bits(s){}
 
-        uint64_t first_set_bit()const     { return _bits ? 63-LZERO(_bits) : 64; }
-        bool     get( uint64_t pos )const { return _bits & (1ll<<(pos));   }
+        /**
+         *  option A: use conditional to check for 0 and return 64
+         */
+        //uint64_t first_set_bit()const     { return _bits == 0 ? 64 : LZERO(_bits); }
+
+        /**
+         *  Option 2, compare + shift + lzr + compare + mult + or... this approach.. while
+         *  the result of LZERO(0) is undefined, multiplying it by 0 is defined.
+         *
+         *  This code may be faster or slower depending upon this cache miss rate and
+         *  the instruction level parallelism.  Benchmarks are required.
+         */
+        uint64_t first_set_bit()const     { return (_bits == 0)<<6 | (LZERO(_bits) * (_bits!=0)); }
+        bool     get( uint64_t pos )const { return _bits & (1ll<<(63-pos));   }
         void     set( uint64_t pos )    
         { 
             assert( pos < 64 );
             fprintf( stderr, "b64 set %d\n", pos );
-            _bits |= (1ll<<(pos));       
+            _bits |= (1ll<<(63-pos));       
         }
         bool     clear( uint64_t pos )  
         { 
-            _bits &= ~(1ll<<(pos));      
+            _bits &= ~(1ll<<(63-pos));      
             return _bits == 0;
         }
 
@@ -91,74 +97,239 @@ class bit_index<64>
 
         void set_all()   { _bits = -1; }
         void clear_all() { _bits = 0;  }
+
+        uint64_t& get_bits( uint64_t bit )
+        {
+            assert( bit < 64 );
+            return _bits;
+        }
+
+        struct iterator
+        {
+           public:
+              uint64_t& get_bits()       { return _self->_bits; }
+              bool     end()const       { return _bit == 64;   }
+              int64_t  bit()const       { return _bit; }
+              void     set()            { _self->set(_bit); }
+              bool     clear()          { return _self->clear(_bit); }
+              bool     operator*()const { return _self->get(_bit); }
+
+              iterator&  next_set_bit()
+              {
+                  ++_bit;
+                  if( end() ) return *this;
+                  bit_index tmp( (_self->_bits << (_bit))>>(_bit) );  
+                  _bit = tmp.first_set_bit();
+                  return *this;
+              }
+
+              iterator( bit_index* s=nullptr, uint8_t b = 64 ):_self(s),_bit(b){}
+           private:
+              bit_index* _self;
+              uint8_t     _bit;
+
+        };
+
+        iterator begin()      { return iterator(this,0); }
+        iterator at(uint8_t i){ return iterator(this,i); }
+        iterator end()        { return iterator(this,64); }
     protected:
+        friend class iterator;
         uint64_t _bits;
 };
 
+/**
+ *   A bit_index is a bitset optimized for searching for set bits.  The
+ *   operations set and clear maintain higher-level indexes to optimize
+ *   finding of set bits.
+ *
+ *   The fundamental size is 64 bit and the first set bit can be found
+ *   with a single instruction. For indexes up-to 64*64 in size, the
+ *   first set bit can be found with 2 clz + 1 compare + 1 mult + 1 add.
+ *
+ */
 template<uint64_t Size>
 class bit_index
 {
     public:
+     // static_assert( Size >= 64, "smaller sizes not yet supported" );
+
       enum size_enum { 
-        index_size  = Size
-     };
+         index_size        = Size,
+         sub_index_size    = (Size+63) / 64,
+         sub_index_count   = Size / sub_index_size 
+      };
+       static_assert( bit_index::sub_index_count > 0, "array with size 0 is too small" );
+       static_assert( bit_index::sub_index_count <= 64, "array with size 64 is too big" );
+      
+      uint64_t first_set_bit()const
+      {
+          int base = _base_index.first_set_bit();
+          if( base >= sub_index_count ) 
+              return Size;
+      
+          return base * sub_index_size + _sub_index[base].first_set_bit();
+      }
+      bool get( uint64_t bit )const
+      {
+         assert( bit < Size );
+         int64_t sub_idx     = (bit/64)%64;
+         int64_t sub_idx_bit = (bit%sub_index_size);
+         return _sub_index[sub_idx].get(  sub_idx_bit );
+      }
+      
+      void set( uint64_t bit )
+      {
+         assert( bit < Size );
+         int64_t sub_idx     = (bit/64)%64;
+         int64_t sub_idx_bit = (bit%sub_index_size);
+         _base_index.set(sub_idx);
+         return _sub_index[sub_idx].set( sub_idx_bit );
+      }
+      
+      bool clear( uint64_t bit )
+      {
+         assert( bit < Size );
+         int64_t sub_idx     = (bit/64)%64;
+         int64_t sub_idx_bit = (bit%sub_index_size);
+         if( _sub_index[sub_idx].clear( sub_idx_bit ) )
+            return _base_index.clear(sub_idx);
+         return false;
+      }
+      
+      void set_all()
+      {
+         _base_index.set_all();
+         for( uint64_t i = 0; i < sub_index_count; ++i )
+         {
+           _sub_index[i].set_all();
+         }
+      }
+      
+      void clear_all()
+      {
+         _base_index.clear_all();
+         for( uint64_t i = 0; i < sub_index_count; ++i )
+         {
+           _sub_index[i].clear_all();
+         }
+      }
+      
+      uint64_t count()const
+      {
+         uint64_t c = 0;
+         for( uint64_t i = 0; i < sub_index_count; ++i )
+         {
+            c+=_sub_index[i].count();
+         }
+         return 0;
+      }
 
-        uint64_t first_set_bit()const
-        {
-            int base = _base_index.first_set_bit();
-            fprintf( stderr, "base %d\n", base );
-            if( base*64*64 >= Size ) return Size;
+      /**
+       *  Returns the in64_t that contains bit
+       */
+      uint64_t& get_bits( uint64_t bit )
+      {
+         int64_t sub_idx      = (bit/64)%64;
+         int64_t sub_idx_bit  = (bit%sub_index_size);
+         return _sub_index[_sub_index].get_bits( sub_idx_bit );
+      }
 
-            return (base) * Size/64/64 + _this_index[base].first_set_bit();
-        }
-        bool get( uint64_t bit )const
-        {
-           return _this_index[bit/(Size/64/64)].get( bit%(Size/64) );
-        }
 
-        void set( uint64_t bit )
-        {
-           _base_index.set( bit/(Size/64/64) );
-           return _this_index[bit/(Size/64/64)].set( (bit %(Size/64/64)) );
-        }
+      struct iterator
+      {
+         public:
+            int64_t&   get_bits()         { return sub_itr.get_bits(); }
+            bool       operator*()const   { return *sub_itr;           }
+            bool       end()const { return sub_idx >= sub_index_count; }
+            int64_t    bit()const { return pos; }
+            void       set() 
+            { 
+                bit_idx->_base_index.set(sub_idx); 
+                sub_itr.set();
+            }
+            bool       clear() 
+            { 
+                if( sub_itr.clear() )
+                {
+                  return bit_idx->_base_index.clear(sub_idx); 
+                }
+                return false;
+            }
 
-        bool clear( uint64_t bit )
-        {
-           if( _this_index[bit/(Size/64/64)].clear( bit %(Size/64) ) )
-              return _base_index.clear( bit/(Size/64/64) );
-           return false;
-        }
+            /**
+             *  Find the next bit after this one that is set..
+             */
+            iterator&  next_set_bit()
+            {
+                if( end() ) return *this;
+                sub_itr.next_set_bit();
+                if( sub_itr.end() )
+                {
+                   sub_idx = bit_idx->_base_index.at(sub_idx).next_set_bit().bit();
+                   if( end() )
+                   {
+                      pos = Size;
+                      return *this;
+                   }
+                   auto fb = bit_idx->_sub_index[sub_idx].first_set_bit();
+                   sub_itr = bit_idx->_sub_index[sub_idx].at(fb);
+                }
+                pos = sub_idx * sub_index_size + sub_itr.bit();
+                return *this;
+            }
 
-        void set_all()
-        {
-           _base_index.set_all();
-           for( uint64_t i = 0; i < (Size/64)%64; ++i )
-           {
-             _this_index[i].set_all();
-           }
-        }
+            /**
+             *  Move to the next bit.
+             */
+            iterator&  operator++()
+            { 
+               assert( !end() );
+               ++pos;
+               ++sub_itr;
+               if( sub_itr.end() )
+               {
+                  ++sub_idx;
+                  if( !end() )
+                  {
+                     sub_itr = bit_idx->_sub_index[sub_idx].begin();
+                  }
+                  else pos = Size;
+               }
+               return *this;
+            }
+            iterator& operator++(int) { return this->operator++(); }
+            iterator operator+(uint64_t delta) { return iterator( bit_idx, pos + delta ); }
 
-        void clear_all()
-        {
-           _base_index.clear_all();
-           for( uint64_t i = 0; i < (Size/64)%64; ++i )
-           {
-             _this_index[i].clear_all();
-           }
-        }
 
-        uint64_t count()const
-        {
-           uint64_t c = 0;
-           for( uint64_t i = 0; i < (Size/64)%64; ++i )
-           {
-              c+=_this_index[i].count();
-           }
-           return 0;
-        }
+            iterator( bit_index* self=nullptr, int64_t bit=Size)
+            :bit_idx(self),pos(bit),sub_idx((bit/64)%64)
+            {
+               sub_itr = bit_idx->_sub_index[sub_idx].at(bit%sub_index_size);
+            }
+            iterator& operator=(const iterator& i )
+            {
+               bit_idx = i.bit_idx;
+               pos = i.pos;
+               sub_idx = i.sub_idx;
+               sub_itr = i.sub_itr;
+               return *this;
+            }
+         private:
+            friend class bit_index;
+            bit_index*                          bit_idx;
+            int64_t                             pos;
+            int8_t                              sub_idx;
+            typename bit_index<sub_index_size>::iterator sub_itr;
+      };
+
+      iterator begin()            { return iterator( this, 0 );    }
+      iterator end()              { return iterator( this, Size ); }
+      iterator at(int64_t p)      { return iterator( this, p );    }
     protected:
-        bit_index<(Size/64/64)>  _base_index;
-        bit_index<(Size/64/64)>  _this_index[64];
+      friend class iterator;
+      bit_index<64>              _base_index;
+      bit_index<sub_index_size>  _sub_index[sub_index_count];
 };
 
 
