@@ -11,4 +11,6 @@ ELSE(WIN32)
 ENDIF(WIN32)
 
 
-add_executable( m3 malloc3.cpp )
+#add_executable( m3 malloc3.cpp )
+add_executable( fheap bench.cpp )
+target_link_libraries( fheap jemalloc )
