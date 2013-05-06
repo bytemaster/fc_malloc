@@ -36,11 +36,11 @@ class bit_index<1>
     enum size_enum { index_size = 1 };
     void set( uint64_t pos = 0)
     {
-      fprintf( stderr, "set pos %lld\n", pos );
       assert( pos == 0 );
       bit = 1;
     }
     bool get( uint32_t pos = 0)const { return bit; }
+    uint64_t& get_bits(uint64_t ) { return bit; }
 
     bool clear( uint64_t pos  = 0)
     {
@@ -52,8 +52,34 @@ class bit_index<1>
 
     uint64_t first_set_bit()const { return !bit; }
     uint64_t size()const          { return 1;    }
+
+
+    struct iterator
+    {
+       public:
+          uint64_t& get_bits()      { return _self->bit; }
+          bool     end()const       { return _bit == 1;   }
+          int64_t  bit()const       { return _bit; }
+          void     set()            { _self->set(_bit); }
+          bool     clear()          { return _self->clear(_bit); }
+          bool     operator*()const { return _self->get(_bit); }
+
+          iterator&  next_set_bit()
+          {
+              _bit = 1;
+              return *this;
+          }
+
+          iterator( bit_index* s=nullptr, uint8_t b = 64 ):_self(s),_bit(b){}
+       private:
+          bit_index* _self;
+          uint8_t     _bit;
+    };
+
+    iterator at( uint64_t p ) { return iterator(this, p); }
+
   private:
-    bool bit;
+    uint64_t bit;
 };
 
 template<>
@@ -69,7 +95,16 @@ class bit_index<64>
         /**
          *  option A: use conditional to check for 0 and return 64
          */
-        //uint64_t first_set_bit()const     { return _bits == 0 ? 64 : LZERO(_bits); }
+        uint64_t first_set_bit()const     { 
+            return _bits == 0 ? 64 : LZERO(_bits); 
+        }
+
+        void dump( int depth )
+        {
+           for( int i = 0; i < depth; ++i )
+              fprintf( stderr, "    " );
+           fprintf( stderr, "%llx\n", _bits );
+        }
 
         /**
          *  Option 2, compare + shift + lzr + compare + mult + or... this approach.. while
@@ -78,17 +113,19 @@ class bit_index<64>
          *  This code may be faster or slower depending upon this cache miss rate and
          *  the instruction level parallelism.  Benchmarks are required.
          */
-        uint64_t first_set_bit()const     { return (_bits == 0)<<6 | (LZERO(_bits) * (_bits!=0)); }
+        //uint64_t first_set_bit()const     { return (_bits == 0)<<6 | (LZERO(_bits) * (_bits!=0)); }
         bool     get( uint64_t pos )const { return _bits & (1ll<<(63-pos));   }
         void     set( uint64_t pos )    
         { 
             assert( pos < 64 );
-            fprintf( stderr, "b64 set %d\n", pos );
             _bits |= (1ll<<(63-pos));       
         }
         bool     clear( uint64_t pos )  
         { 
+//            fprintf( stderr, "bit_index<64>::clear %llu\n", pos );
             _bits &= ~(1ll<<(63-pos));      
+            //fprintf( stderr, "bit_index<64> clear: %p   %llx\n", this, _bits );
+            //fprintf( stderr, "bit_index<64>::clear %llu return %llu == 0\n", pos, _bits );
             return _bits == 0;
         }
 
@@ -152,7 +189,7 @@ template<uint64_t Size>
 class bit_index
 {
     public:
-     // static_assert( Size >= 64, "smaller sizes not yet supported" );
+      static_assert( Size >= 64, "smaller sizes not yet supported" );
 
       enum size_enum { 
          index_size        = Size,
@@ -161,19 +198,37 @@ class bit_index
       };
        static_assert( bit_index::sub_index_count > 0, "array with size 0 is too small" );
        static_assert( bit_index::sub_index_count <= 64, "array with size 64 is too big" );
+
+
+      void dump( int depth = 0 )
+      {
+           _base_index.dump( depth + 1 );
+           for( int i = 0; i < 3; ++i )
+             _sub_index[i].dump( depth + 2 );
+
+/**
+           for( int i = 0; i < depth; ++i )
+              fprintf( stderr, "    " );
+           fprintf( stderr, "%llx\n", _bits );
+           */
+      }
+
       
+      uint64_t size()const  { return index_size; }
       uint64_t first_set_bit()const
       {
-          int base = _base_index.first_set_bit();
+          uint64_t base = _base_index.first_set_bit();
           if( base >= sub_index_count ) 
+          {
               return Size;
-      
-          return base * sub_index_size + _sub_index[base].first_set_bit();
+          }
+          auto subidx = _sub_index[base].first_set_bit();
+          return base * sub_index_size + subidx; //_sub_index[base].first_set_bit(); 
       }
       bool get( uint64_t bit )const
       {
          assert( bit < Size );
-         int64_t sub_idx     = (bit/64)%64;
+         int64_t sub_idx     = (bit/sub_index_size);
          int64_t sub_idx_bit = (bit%sub_index_size);
          return _sub_index[sub_idx].get(  sub_idx_bit );
       }
@@ -181,7 +236,7 @@ class bit_index
       void set( uint64_t bit )
       {
          assert( bit < Size );
-         int64_t sub_idx     = (bit/64)%64;
+         int64_t sub_idx     = (bit/sub_index_size);
          int64_t sub_idx_bit = (bit%sub_index_size);
          _base_index.set(sub_idx);
          return _sub_index[sub_idx].set( sub_idx_bit );
@@ -190,7 +245,7 @@ class bit_index
       bool clear( uint64_t bit )
       {
          assert( bit < Size );
-         int64_t sub_idx     = (bit/64)%64;
+         int64_t sub_idx     = (bit/sub_index_size);
          int64_t sub_idx_bit = (bit%sub_index_size);
          if( _sub_index[sub_idx].clear( sub_idx_bit ) )
             return _base_index.clear(sub_idx);
@@ -230,16 +285,16 @@ class bit_index
        */
       uint64_t& get_bits( uint64_t bit )
       {
-         int64_t sub_idx      = (bit/64)%64;
+         int64_t sub_idx      = (bit/sub_index_size);
          int64_t sub_idx_bit  = (bit%sub_index_size);
-         return _sub_index[_sub_index].get_bits( sub_idx_bit );
+         return _sub_index[sub_idx].get_bits( sub_idx_bit );
       }
 
 
       struct iterator
       {
          public:
-            int64_t&   get_bits()         { return sub_itr.get_bits(); }
+            uint64_t&  get_bits()         { return sub_itr.get_bits(); }
             bool       operator*()const   { return *sub_itr;           }
             bool       end()const { return sub_idx >= sub_index_count; }
             int64_t    bit()const { return pos; }

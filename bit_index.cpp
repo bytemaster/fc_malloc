@@ -3,6 +3,28 @@
 
 int main( int argc, char** argv )
 {
+
+    bit_index<64*64*64> b;
+    b.set_all();
+    for( int i = 0; i < 66; ++i )
+    {
+      b.clear(i);
+      assert( !b.get(i) );
+      fprintf( stderr, "\nI: %d\n", i );
+      if( i >= 62 )
+          b.dump();
+      if( b.first_set_bit() != i+1 )
+      {
+          exit(1);
+      }
+    }
+    for( int i = 0; i < 66; ++i )
+    {
+      assert( !b.get(i) );
+    }
+    assert( b.get(67) );
+
+    return 0;
     fprintf( stderr, "pow64(1) = %d\n", pow64<1>::value );
     fprintf( stderr, "pow64(2) = %d\n", pow64<2>::value );
     fprintf( stderr, "log64(pow64(2)) = %d\n", log64<pow64<2>::value>::value );
@@ -56,12 +78,14 @@ int main( int argc, char** argv )
     _bbb.set(444);
     assert(_bbb.get(444) );
     }
+    /*
     {
     bit_index<20*64*64> _bbb;
     fprintf( stderr, "size of %d  64*64*64*64  \n\n\n", int(sizeof(_bbb) ) );
     _bbb.set(444);
     assert(_bbb.get(444) );
     }
+    */
 
     _index.set(3);
     _index.set(9);

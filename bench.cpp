@@ -1,17 +1,21 @@
-#include "fc_heap.hpp"
+#include "fixed_pool.hpp"
 #include <thread>
-#define BENCH_SIZE ( (16) )
-#define ROUNDS 200*64*512
+#include <string.h>
+#include <stdio.h>
+#include <iostream>
+#include <sstream>
+#define BENCH_SIZE ( (1024) )
+#define ROUNDS 40*64*512
 
 /*  SEQUENTIAL BENCH
 int main( int argc, char** argv )
 {
   if( argc == 2 && argv[1][0] == 'S' )
   {
-     printf( "malloc2\n");
+     printf( "fp_malloc\n");
      for( int i = 0; i < 50000000; ++i )
      {
-        char* test = malloc2( 128 );
+        char* test = fp_malloc( 128 );
         assert( test != nullptr );
         test[0] = 1;
         free2( test );
@@ -49,7 +53,7 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
          uint32_t p = rand() % buffers[pro].size();
          if( !buffers[pro][p] )
          {
-           uint64_t si = 1 +rand()%(63); //4000;//32 + rand() % (1<<16);
+           uint64_t si = 32;// +rand()%(1024); //4000;//32 + rand() % (1<<16);
            total_alloc += si;
            int64_t* r = (int64_t*)do_alloc( si );
       //     block_header* bh = ((block_header*)r)-1;
@@ -201,13 +205,15 @@ void  do_malloc_free(char* c)
 
 char* do_fc_malloc(int s)
 { 
-    return (char*)fc_malloc(s); 
+  return (char*)fp_malloc(s);
+//    return (char*)fc_malloc(s); 
 //   return (char*)scalable_malloc(s);
 }
 void  do_fc_free(char* c)
 { 
+  fp_free((void*)c);
 //    scalable_free(c);
-   fc_free(c); 
+//   fc_free(c); 
 }
 
 
@@ -233,7 +239,8 @@ int main( int argc, char** argv )
   if( argc > 2 && argv[1][0] == 'M' )
   {
     std::cerr<<"hash malloc multi\n";
- //   pc_bench( atoi(argv[2]), malloc2, free2 );
+//    pc_bench( atoi(argv[2]), do_fp_malloc, do_fp_free );
+    pc_bench( atoi(argv[2]), do_fc_malloc, do_fc_free );
     return 0;
   }
   if( argc > 1 && argv[1][0] == 's' )
@@ -248,9 +255,6 @@ int main( int argc, char** argv )
     pc_bench_st( do_fc_malloc, do_fc_free );
     return 0;
   }
-  return -1;
-}
-#if 0
   std::string line;
   std::getline( std::cin, line );
     std::vector<char*> data;
@@ -264,18 +268,18 @@ int main( int argc, char** argv )
     {
       int64_t bytes;
       ss >> bytes;
-      data.push_back( malloc2( bytes ) );
+      data.push_back( (char*)fp_malloc( bytes ) );
     }
     if( cmd == "f" ) // free data at index
     {
       int64_t idx;
       ss >> idx;
-      free2( data[idx] );
+      fp_free( data[idx] );
       data.erase( data.begin() + idx );
     }
     if( cmd == "c" ) // print cache
     {
-      thread_allocator::get().print_cache();
+    //  thread_allocator::get().print_cache();
     }
     if( cmd == "p" ) // print heap
     {
@@ -287,20 +291,22 @@ int main( int argc, char** argv )
        fprintf( stderr, "-----------------------------\n");
        for( size_t i = 0; i < data.size(); ++i )
        {
-          block_header* bh = reinterpret_cast<block_header*>(data[i]-8);
-          fprintf( stderr, "%d]  %p / %p    %d   %d\n", int(i), data[i], data[i]-8, bh->raw_size(), bh->raw_prev_size() );
+     //     block_header* bh = reinterpret_cast<block_header*>(data[i]-8);
+          fprintf( stderr, "%d]  %p \n", int(i), data[i]);
 
        }
     }
     std::getline( std::cin, line );
   }
-
+  return 0;
+}
+#if 0
   printf( "alloc\n" );
-  char* tmp = malloc2( 61 );
+  char* tmp = fp_malloc( 61 );
   usleep( 1000 );
-  char* tmp2 = malloc2( 134 );
+  char* tmp2 = fp_malloc( 134 );
   usleep( 1000 );
-  char* tmp4 = malloc2( 899 );
+  char* tmp4 = fp_malloc( 899 );
   printf( "a %p  b %p   c %p\n", tmp, tmp2, tmp4 );
 
   usleep( 1000 );
@@ -315,11 +321,11 @@ int main( int argc, char** argv )
   usleep( 1000*1000 );
 
   printf( "alloc again\n" );
-  char* tmp1 = malloc2( 61 );
+  char* tmp1 = fp_malloc( 61 );
   usleep( 1000 );
-  char* tmp3 = malloc2( 134 );
+  char* tmp3 = fp_malloc( 134 );
   usleep( 1000 );
-  char* tmp5 = malloc2( 899 );
+  char* tmp5 = fp_malloc( 899 );
   printf( "a %p  b %p   c %p\n", tmp1, tmp3, tmp5 );
   free2( tmp1 );
   free2( tmp3 );
