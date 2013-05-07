@@ -4,8 +4,8 @@
 #include <stdio.h>
 #include <iostream>
 #include <sstream>
-#define BENCH_SIZE ( (1024) )
-#define ROUNDS 40*64*512
+#define BENCH_SIZE ( (1024*16*2) )
+#define ROUNDS 3000
 
 /*  SEQUENTIAL BENCH
 int main( int argc, char** argv )
@@ -48,12 +48,12 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
 
   for( int r = 0; r < ROUNDS; ++r )
   {
-      for( size_t x = 0; x < 4*4 ; ++x )
+      for( size_t x = 0; x < BENCH_SIZE/4 ; ++x )
       {
          uint32_t p = rand() % buffers[pro].size();
          if( !buffers[pro][p] )
          {
-           uint64_t si = 32;// +rand()%(1024); //4000;//32 + rand() % (1<<16);
+           uint64_t si = 10000;//16 +rand()%(1024); //4000;//32 + rand() % (1<<16);
            total_alloc += si;
            int64_t* r = (int64_t*)do_alloc( si );
       //     block_header* bh = ((block_header*)r)-1;
@@ -68,7 +68,7 @@ void pc_bench_worker( int pro, int con, char* (*do_alloc)(int s), void (*do_free
            buffers[pro][p] = r;
          }
       }
-      for( size_t x = 0; x < 4*4 ; ++x )
+      for( size_t x = 0; x < BENCH_SIZE/4 ; ++x )
       {
          uint32_t p = rand() % buffers[con].size();
          assert( p < buffers[con].size() );
